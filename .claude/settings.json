@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 make_sandbox.py *)",
+      "Bash(python3 score.py *)",
+      "Bash(python3 tools/check_submission_zip.py *)",
+      "Bash(python3 tests/local_eval.py *)",
+      "Bash(python make_sandbox.py *)",
+      "Bash(python score.py *)",
+      "Bash(python tools/check_submission_zip.py *)",
+      "Bash(python tests/local_eval.py *)"
+    ]
+  }
+}
