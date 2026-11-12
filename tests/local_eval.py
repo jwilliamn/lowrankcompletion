@@ -70,8 +70,13 @@ def synthesize(schema, seed=0, given_effect=0.7, pair_effect=1.0,
             pair, size = np.zeros(n, dtype=np.int64), 1
             for parent in parents:
                 levels = pd.Categorical(data[parent]).codes
-                effect = rng.normal(scale=given_effect,
-                                    size=(levels.max() + 1, len(values)))
+                if len(values) >= 5:      # ordered answers: shift along the order
+                    effect = np.outer(
+                        rng.normal(scale=2 * given_effect, size=levels.max() + 1),
+                        np.linspace(-1, 1, len(values)))
+                else:
+                    effect = rng.normal(scale=given_effect,
+                                        size=(levels.max() + 1, len(values)))
                 logits += effect[levels]
                 pair = pair * (levels.max() + 1) + levels
                 size *= levels.max() + 1
@@ -96,7 +101,14 @@ def synthesize(schema, seed=0, given_effect=0.7, pair_effect=1.0,
         keep = rng.uniform(size=fresh.shape) < 0.05
         keep[:, [items.index(g) for g in given]] = False
         if given:
-            keep[:, items.index(given[0])] = True
+            # Like a survey-round column: the repeat interview always has a
+            # different value in the first GIVEN item.
+            first = items.index(given[0])
+            levels = list(records[given[0]]["values"])
+            if len(levels) > 1:
+                values[copies, first] = [
+                    levels[(levels.index(v) + 1) % len(levels)]
+                    if v in levels else v for v in values[copies, first]]
         values[copies] = np.where(keep, fresh, values[copies])
         frame = pd.DataFrame(values, columns=items, dtype=object)
         for name in order:        # re-apply skip logic after the edits

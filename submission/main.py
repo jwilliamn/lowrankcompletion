@@ -1,4 +1,4 @@
-"""SimulacraBench submission, v2.
+"""SimulacraBench submission, v3.
 
 For every held-out respondent only the GIVEN block is visible, so each PREDICT
 item is modelled as P(answer | GIVEN). Everything is fitted inside predict()
@@ -12,7 +12,11 @@ Per item:
      fold:
        c0  crowd marginal
        c1  count backoff over the two most informative GIVEN columns
-       c2  multinomial logistic regression on one-hot GIVEN, three L2 strengths
+       c2  multinomial logistic regression on one-hot GIVEN, several L2 strengths
+       c2b the same with an "ordered answers" head: instead of one free weight
+           per answer option, each item gets a shift and a spread along its
+           option order plus a skip-slot term; far fewer parameters, meant
+           for binned scores, hours and wages
        c3  multi-task neural net (shared trunk, one softmax head per item),
            read out at several training lengths; picks up interactions
   3. The candidates are mixed with per-item weights chosen on the out-of-fold
@@ -21,8 +25,9 @@ Per item:
   4. Profile matching. Visible respondents whose GIVEN profile is identical or
      nearly identical to the target's (for example the same household in
      another survey round) vote with their own answers; where there is no
-     close match the mixed model from step 3 is used unchanged. How far to
-     trust the matches is again chosen per item out of fold.
+     close match the mixed model from step 3 is used unchanged. A second pass
+     ignores the one GIVEN item whose mismatch matters least, found out of
+     fold. How far to trust the matches is again chosen per item out of fold.
 
 If anything fails, predict() returns the crowd marginal instead of raising.
 """
@@ -48,13 +53,16 @@ N_FOLDS = 5
 MIN_TRAIN_ROWS = 50
 BACKOFF_ALPHA = 10.0
 BACKOFF_COLUMNS = 2
-L2_STRENGTHS = (1e-3, 1e-4, 1e-5)
+L2_STRENGTHS = (1e-2, 1e-3, 1e-4, 1e-5)
+TILT_L2 = (1e-3, 1e-4)
 # Profile matching: weight exp(-beta * mismatches); matches further away than
 # `reach` mismatches count for less than the fallback model.
 MATCH_BETA = 6.0
 MATCH_REACH = (0.5, 1.5, 2.5, 3.5)
+MATCH_DROP_REACH = (0.5, 1.5)
+MATCH_DROP_SAMPLE = 1500
 MLP_CHECKPOINTS = (4, 8, 16, 32)     # epochs at which the net is read out
-MLP_SEEDS = (0, 1)
+MLP_SEEDS = (0, 1, 2)
 MLP_HIDDEN = 512
 MLP_DROPOUT = 0.15
 SEED = 0
@@ -65,7 +73,7 @@ _calls = 0
 
 def _log(message):
     if VERBOSE:
-        print("[v2 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
+        print("[v3 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
 
 
 # ---------------------------------------------------------------- encoding --
@@ -173,7 +181,10 @@ class _Linear:
     each item owns a contiguous run of slots and has its own softmax.
     """
 
-    def __init__(self, widths, device):
+    def __init__(self, widths, device, basis=None):
+        # basis [slots, outputs]: when given, the model predicts `outputs`
+        # numbers per respondent and logits are their combination.
+        self.basis = basis
         self.widths = list(widths)
         self.offsets = np.concatenate([[0], np.cumsum(self.widths)]).astype(int)
         self.n_slots = int(self.offsets[-1])
@@ -195,7 +206,8 @@ class _Linear:
         y = torch.as_tensor(y, device=self.device)
         valid = (y >= 0).to(x.dtype)
         target = y.clamp_min(0) + self.offsets_t
-        weight = torch.zeros(x.shape[1], self.n_slots, device=self.device,
+        outputs = self.n_slots if self.basis is None else self.basis.shape[1]
+        weight = torch.zeros(x.shape[1], outputs, device=self.device,
                              dtype=x.dtype, requires_grad=True)
         offset = torch.as_tensor(bias, device=self.device,
                                  dtype=x.dtype).clone().requires_grad_(True)
@@ -206,7 +218,7 @@ class _Linear:
 
         def closure():
             optimizer.zero_grad()
-            logits = x @ weight + offset
+            logits = self._logits(x, weight, offset)
             picked = logits.gather(1, target)
             loss = ((self._log_norm(logits) - picked) * valid).sum() / rows
             loss = loss + l2 * (weight ** 2).sum()
@@ -221,9 +233,33 @@ class _Linear:
         """Probabilities as one flat [rows, n_slots] array."""
         with torch.no_grad():
             x = torch.as_tensor(x, device=self.device)
-            logits = x @ self.weight + self.offset
+            logits = self._logits(x, self.weight, self.offset)
             log_p = logits - self._log_norm(logits)[:, self.slot_item]
             return torch.exp(log_p).double().cpu().numpy()
+
+    def _logits(self, x, weight, offset):
+        scores = x @ weight
+        if self.basis is not None:
+            scores = scores @ self.basis.T
+        return scores + offset
+
+
+def _tilt_basis(widths, gated, device):
+    """Basis for the "ordered answers" head: per item a shift along the
+    option order, a spread term, and a term for the skip slot."""
+    n_slots = int(sum(widths))
+    basis = np.zeros((n_slots, 3 * len(widths)), dtype=np.float32)
+    start = 0
+    for j, width in enumerate(widths):
+        values = width - (1 if gated[j] else 0)
+        if values > 1:
+            t = np.linspace(-1.0, 1.0, values)
+            basis[start:start + values, 3 * j] = t
+            basis[start:start + values, 3 * j + 1] = t ** 2 - np.mean(t ** 2)
+        if gated[j]:
+            basis[start + width - 1, 3 * j + 2] = 1.0
+        start += width
+    return torch.as_tensor(basis, device=device)
 
 
 def _masked_loss(logits, target, valid, log_norm):
@@ -232,21 +268,28 @@ def _masked_loss(logits, target, valid, log_norm):
 
 
 # -------------------------------------------------------- profile matching --
-def _match(x_all, y_fit_all, splits, widths, smooth, n_given, device):
+def _match(x_all, y_fit_all, splits, widths, smooth, n_given, device,
+           drop=None, reaches=MATCH_REACH, only=None):
     """Let near-identical visible respondents vote, backed by `smooth`.
 
     A visible respondent's weight is exp(-MATCH_BETA * mismatching GIVEN
     answers). The fallback model `smooth` enters with the weight of a match
     at `reach` mismatches, so closer matches override it and farther ones do
-    not. Returns one table [rows, slots] per value in MATCH_REACH.
+    not. `drop` = (first, last) one-hot columns of a GIVEN item to ignore.
+    `only` restricts the rows that are predicted. Returns one table
+    [rows, slots] per value in `reaches`.
     """
     offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
     n_slots = int(offsets[-1])
     slot_item = torch.as_tensor(np.repeat(np.arange(len(widths)), widths),
                                 device=device)
     offsets_t = torch.as_tensor(offsets[:-1], device=device)
-    tables = [np.zeros((x_all.shape[0], n_slots)) for _ in MATCH_REACH]
+    tables = [np.zeros((x_all.shape[0], n_slots)) for _ in reaches]
     for fit, evaluate in splits:
+        if only is not None:
+            evaluate = np.intersect1d(evaluate, only)
+            if evaluate.size == 0:
+                continue
         y = torch.as_tensor(y_fit_all[fit], device=device)
         valid = (y >= 0).to(torch.float64)
         onehot = torch.zeros(len(fit), n_slots, device=device,
@@ -255,16 +298,52 @@ def _match(x_all, y_fit_all, splits, widths, smooth, n_given, device):
         x_fit = x_all[fit]
         for start in range(0, len(evaluate), 2048):
             chunk = evaluate[start:start + 2048]
-            differ = (n_given - x_all[chunk] @ x_fit.T).double()
-            weight = torch.exp(-MATCH_BETA * differ)
+            differ = n_given - x_all[chunk] @ x_fit.T
+            if drop is not None:
+                lo, hi = drop
+                differ = differ - (1.0 - x_all[chunk][:, lo:hi]
+                                   @ x_fit[:, lo:hi].T)
+            weight = torch.exp(-MATCH_BETA * differ.double())
             top = weight @ onehot
             bottom = (weight @ valid)[:, slot_item]
             prior = torch.as_tensor(smooth[chunk], device=device)
-            for index, reach in enumerate(MATCH_REACH):
+            for index, reach in enumerate(reaches):
                 alpha = float(np.exp(-MATCH_BETA * reach))
                 tables[index][chunk] = (
                     (top + alpha * prior) / (bottom + alpha)).cpu().numpy()
     return tables
+
+
+def _best_drop(x_all, y_fit_all, folds, widths, smooth, cards, device,
+               train_rows, deadline):
+    """The GIVEN item whose mismatch is best ignored when matching profiles,
+    as one-hot (first, last) columns, or None if ignoring none is best.
+
+    Judged out of fold on a sample of visible rows: exact matching on every
+    GIVEN item but one, scored by the log likelihood of the real answers.
+    """
+    rng = np.random.default_rng(SEED + 1)
+    sample = np.sort(rng.choice(train_rows, replace=False, size=min(
+        MATCH_DROP_SAMPLE, train_rows.size)))
+    offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
+
+    def score(drop):
+        table = _match(x_all, y_fit_all, folds, widths, smooth, len(cards),
+                       device, drop=drop, reaches=(0.5,), only=sample)[0]
+        y = y_fit_all[sample]
+        rows, cols = np.nonzero(y >= 0)
+        probs = table[sample[rows], offsets[cols] + y[rows, cols]]
+        return float(np.log(np.clip(probs, 1e-12, None)).sum())
+
+    best, best_score = None, score(None)
+    starts = np.concatenate([[0], np.cumsum(cards)]).astype(int)
+    for g in range(len(cards)):
+        if time.time() > deadline:
+            break
+        value = score((int(starts[g]), int(starts[g + 1])))
+        if value > best_score + 1.0:
+            best, best_score = (int(starts[g]), int(starts[g + 1])), value
+    return best
 
 
 # ------------------------------------------------------------ candidate c3 --
@@ -463,6 +542,8 @@ def _predict_core(frame, schema, deadline):
                 x_np[known, start + g_all[known, g]] = 1.0
                 start += card
             x_all = torch.as_tensor(x_np, device=device)
+            if device == "cpu":
+                torch.set_num_threads(max(1, os.cpu_count() or 1))
         except Exception as error:
             _log("torch setup failed: %s" % type(error).__name__)
 
@@ -479,6 +560,13 @@ def _predict_core(frame, schema, deadline):
                 return None
             return built, time.time() - began
 
+        # Without a GPU everything is several times slower: run a lighter
+        # schedule so the whole run stays inside the time limit.
+        slow = device == "cpu"
+        seeds = MLP_SEEDS[:1] if slow else MLP_SEEDS
+        l2_strengths = L2_STRENGTHS[1:3] if slow else L2_STRENGTHS
+        tilt_l2 = TILT_L2[:1] if slow else TILT_L2
+
         # c3: neural net, first seed
         mlp_tables, mlp_cost = [], 0.0
         done = run("net seed 0", lambda: _mlp(
@@ -487,9 +575,26 @@ def _predict_core(frame, schema, deadline):
             mlp_tables.append(done[0])
             mlp_cost = done[1]
 
+        # c2b: logistic regression with the "ordered answers" head
+        gated = [bool(records[n].get("gate")) for n in targets]
+        for l2 in tilt_l2:
+            def tilt(l2=l2):
+                basis = _tilt_basis(widths, gated, device)
+                table = empty()
+                for fit, evaluate in splits:
+                    bias = np.log(np.clip(c0[evaluate[0]], 1e-6, None))
+                    model = _Linear(widths, device, basis).fit(
+                        x_all[fit], y_fit_all[fit], l2, bias.astype(np.float32))
+                    table[evaluate] = model.predict(x_all[evaluate])
+                return table
+            done = run("ordered l2=%g" % l2, tilt, 0.5 * mlp_cost)
+            if done and usable(done[0]):
+                candidates.append(done[0])
+                names.append("ordered(l2=%g)" % l2)
+
         # c2: logistic regression, strongest penalty first
         last_cost = 0.0
-        for l2 in L2_STRENGTHS:
+        for l2 in l2_strengths:
             def logistic(l2=l2):
                 table = empty()
                 for fit, evaluate in splits:
@@ -507,7 +612,7 @@ def _predict_core(frame, schema, deadline):
                 names.append("logistic(l2=%g)" % l2)
 
         # c3: further seeds, averaged with the first
-        for seed in MLP_SEEDS[1:]:
+        for seed in seeds[1:]:
             if not mlp_tables:
                 break
             done = run("net seed %d" % seed, lambda seed=seed: _mlp(
@@ -548,6 +653,15 @@ def _predict_core(frame, schema, deadline):
         try:
             matched = _match(x_all, y_fit_all, splits, widths, smooth,
                              len(given), device)
+            drop = _best_drop(x_all, y_fit_all, splits[:-1], widths, smooth,
+                              cards, device, train_rows, deadline + 60)
+            if drop is not None:
+                _log("profile matching also ignores GIVEN item %s"
+                     % given[int(np.searchsorted(np.cumsum(cards), drop[0],
+                                                 side="right"))])
+                matched += _match(x_all, y_fit_all, splits, widths, smooth,
+                                  len(given), device, drop=drop,
+                                  reaches=MATCH_DROP_REACH)
             final += [t for t in matched
                       if np.isfinite(t[train_rows]).all()
                       and np.isfinite(t[hidden_rows]).all()]
@@ -572,8 +686,13 @@ def _predict_core(frame, schema, deadline):
             seen = y_all[train_rows, j][decided_all[train_rows, j]]
             extra = np.zeros(widths[j])
             extra[-1] = 5.0
-            mixed[stuck] = _smoothed(
-                np.bincount(seen[seen >= 0], minlength=widths[j]), extra)
+            counts = np.bincount(seen[seen >= 0], minlength=widths[j])
+            if counts.sum() >= 30:
+                # Plenty of evidence: keep only a trace of smoothing.
+                mixed[stuck] = (counts + 0.02 + extra) / (
+                    counts + 0.02 + extra).sum()
+            else:
+                mixed[stuck] = _smoothed(counts, extra)
         result[name] = mixed
 
         if rows.size:
