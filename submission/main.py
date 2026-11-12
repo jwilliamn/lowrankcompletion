@@ -1004,17 +1004,19 @@ def predict(frame, schema):
     global _calls
     _calls += 1
     budget = TOTAL_BUDGET
+    if torch is None or not torch.cuda.is_available():
+        budget -= 100.0          # no GPU: leave a wider safety margin
     try:
         visible = int((~frame.isna().any(axis=1)).sum())
         if visible > int(schema["split"]["n_train"]):
-            budget = max(TOTAL_BUDGET, FINAL_BUDGET)
+            budget = max(budget, FINAL_BUDGET)
     except Exception:
         pass
     remaining = budget - (time.time() - _T0)
     share = remaining / max(1, N_INSTRUMENTS - _calls + 1)
     deadline = time.time() + max(0.0, share)
     try:
-        return _predict_core(frame, schema, deadline, budget > TOTAL_BUDGET)
+        return _predict_core(frame, schema, deadline, budget >= FINAL_BUDGET)
     except Exception as error:
         _log("falling back to the crowd marginal: %s" % type(error).__name__)
         return _marginal_predict(frame, schema)
