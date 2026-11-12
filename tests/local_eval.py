@@ -69,7 +69,7 @@ def synthesize(schema, seed=0, given_effect=0.7, pair_effect=1.0,
             parents = rng.choice(given, size=min(2, len(given)), replace=False)
             pair, size = np.zeros(n, dtype=np.int64), 1
             for parent in parents:
-                levels = pd.Categorical(data[parent]).codes
+                levels = pd.Categorical(data[parent]).codes.astype(np.int64)
                 if len(values) >= 5:      # ordered answers: shift along the order
                     effect = np.outer(
                         rng.normal(scale=2 * given_effect, size=levels.max() + 1),
@@ -199,6 +199,9 @@ def main():
         Path(__file__).resolve().parents[1] / "submission"))
     parser.add_argument("--phase", type=int, default=1, choices=(1, 2))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--rows", type=int, default=0,
+                        help="use this many respondents instead of the "
+                             "schema's count")
     parser.add_argument("--dialect", type=float, default=0.0,
                         help="share of gated items whose skip marker depends "
                              "on the first GIVEN item")
@@ -207,6 +210,14 @@ def main():
     args = parser.parse_args()
 
     schema = load_schema(args.schema)
+    if args.rows and args.rows < schema["dataset"]["n_rows"]:
+        # Shrink the instrument, keeping the split proportions.
+        share = args.rows / schema["dataset"]["n_rows"]
+        split = schema["split"]
+        split["n_dev"] = max(1, int(split["n_dev"] * share))
+        split["n_test"] = max(1, int(split["n_test"] * share))
+        split["n_train"] = args.rows - split["n_dev"] - split["n_test"]
+        schema["dataset"]["n_rows"] = args.rows
     frame, items = synthesize(schema, seed=args.seed, twins=args.twins,
                               dialect=args.dialect)
     shown, visible, cells = mask(frame, items, schema, args.phase)

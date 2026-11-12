@@ -364,14 +364,43 @@ def _best_drop(x_all, y_fit_all, folds, widths, smooth, cards, device,
 
 
 # ------------------------------------------------------------ candidate c3 --
+class _Net(torch.nn.Module if torch is not None else object):
+    """Shared trunk with one softmax head per item. With `vote_width` set, a
+    second, direct path maps the neighbours' votes on an item straight to
+    that item's own answer slots (a small table per item), so reusing or
+    translating a match's answer does not have to squeeze through the trunk.
+    """
+
+    def __init__(self, n_in, n_slots, slot_item, vote_width=0):
+        super().__init__()
+        self.trunk = torch.nn.Sequential(
+            torch.nn.Linear(n_in, MLP_HIDDEN), torch.nn.GELU(),
+            torch.nn.Dropout(MLP_DROPOUT),
+            torch.nn.Linear(MLP_HIDDEN, MLP_HIDDEN), torch.nn.GELU(),
+            torch.nn.Dropout(MLP_DROPOUT),
+            torch.nn.Linear(MLP_HIDDEN, n_slots))
+        self.direct = None
+        if vote_width:
+            blocks = vote_width // n_slots
+            same_item = (slot_item[:, None] == slot_item[None, :]).float()
+            self.register_buffer("mask", same_item.repeat(1, blocks))
+            self.direct = torch.nn.Parameter(torch.zeros(n_slots, vote_width))
+
+    def forward(self, x, votes=None):
+        logits = self.trunk(x)
+        if self.direct is not None:
+            logits = logits + votes @ (self.direct * self.mask).T
+        return logits
+
+
 def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed, features=None):
     """Multi-task net: shared trunk over one-hot GIVEN, a softmax per item.
 
     The net is read out after each epoch count in MLP_CHECKPOINTS, and each
     read-out is its own candidate, so the mixing step chooses how long to
     train, per item. Returns one table [rows, slots] per checkpoint.
-    `features`, when given, holds one (fit, evaluate) pair of input tensors
-    per split and replaces the plain one-hot GIVEN block.
+    `features`, when given, holds per split the tuple returned by
+    _neighbour_features and switches on the direct path from votes.
     """
     helper = _Linear(widths, device)
     n_slots = helper.n_slots
@@ -379,22 +408,22 @@ def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed, features=None):
     for split_index, (fit, evaluate) in enumerate(splits):
         torch.manual_seed(1000 * seed + split_index)
         if features is None:
-            x_fit, x_eval = x_all[fit], x_all[evaluate]
+            x_fit, x_eval, v_fit, v_eval = x_all[fit], x_all[evaluate], None, None
         else:
-            x_fit, x_eval = features[split_index]
-        net = torch.nn.Sequential(
-            torch.nn.Linear(x_fit.shape[1], MLP_HIDDEN), torch.nn.GELU(),
-            torch.nn.Dropout(MLP_DROPOUT),
-            torch.nn.Linear(MLP_HIDDEN, MLP_HIDDEN), torch.nn.GELU(),
-            torch.nn.Dropout(MLP_DROPOUT),
-            torch.nn.Linear(MLP_HIDDEN, n_slots)).to(device)
+            x_fit, x_eval, v_fit, v_eval = features[split_index]
+        net = _Net(x_fit.shape[1], n_slots, helper.slot_item,
+                   0 if v_fit is None else v_fit.shape[1]).to(device)
         with torch.no_grad():
-            net[-1].weight.mul_(0.1)
-            net[-1].bias.copy_(torch.as_tensor(
+            net.trunk[-1].weight.mul_(0.1)
+            net.trunk[-1].bias.copy_(torch.as_tensor(
                 np.log(np.clip(c0[evaluate[0]], 1e-6, None)),
                 device=device, dtype=torch.float32))
-        optimizer = torch.optim.AdamW(net.parameters(), lr=2e-3,
-                                      weight_decay=1e-2)
+        groups = [{"params": net.trunk.parameters(), "lr": 2e-3,
+                   "weight_decay": 1e-2}]
+        if net.direct is not None:
+            groups.append({"params": [net.direct], "lr": 1e-2,
+                           "weight_decay": 1e-3})
+        optimizer = torch.optim.AdamW(groups)
         y = torch.as_tensor(y_fit_all[fit], device=device)
         valid = (y >= 0).to(torch.float32)
         target = y.clamp_min(0) + helper.offsets_t
@@ -406,14 +435,15 @@ def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed, features=None):
             for start in range(0, len(fit), 256):
                 rows = order[start:start + 256]
                 optimizer.zero_grad()
-                loss = _masked_loss(net(x_fit[rows]), target[rows],
-                                    valid[rows], helper._log_norm)
+                logits = net(x_fit[rows], None if v_fit is None else v_fit[rows])
+                loss = _masked_loss(logits, target[rows], valid[rows],
+                                    helper._log_norm)
                 loss.backward()
                 optimizer.step()
             if epoch in MLP_CHECKPOINTS:
                 net.eval()
                 with torch.no_grad():
-                    logits = net(x_eval)
+                    logits = net(x_eval, v_eval)
                     log_p = logits - helper._log_norm(logits)[:, helper.slot_item]
                     tables[MLP_CHECKPOINTS.index(epoch)][evaluate] = (
                         torch.exp(log_p).double().cpu().numpy())
@@ -467,11 +497,17 @@ def _twin_column(x_all, train_rows, cards, device):
 
 def _neighbour_features(x_all, y_fit_all, fit, evaluate, widths, twin,
                         n_given, device):
-    """Inputs for the neighbour-aware net: the one-hot GIVEN block plus, for
-    every answer slot, the vote of the respondent's closest profile matches
-    among the `fit` rows. Three votes: exact matches; matches that differ
-    only on the twin item; matches within about one mismatch. A fit row
-    never votes for itself."""
+    """Inputs for the neighbour-aware net.
+
+    For every answer slot, the vote of the respondent's closest profile
+    matches among the `fit` rows: exact matches; matches within about one
+    mismatch; and matches that differ only on the twin item, kept apart by
+    the respondent's own level of that item (so that "my match from round 1
+    said X" and "my match from round 2 said X" are different inputs). Votes
+    are on a log scale. A fit row never votes for itself.
+
+    Returns (trunk inputs, votes) for the fit rows and for the evaluate rows.
+    """
     offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
     n_slots = int(offsets[-1])
     slot_item = torch.as_tensor(np.repeat(np.arange(len(widths)), widths),
@@ -484,8 +520,11 @@ def _neighbour_features(x_all, y_fit_all, fit, evaluate, widths, twin,
     x_fit = x_all[fit]
     near, far = float(np.exp(-MATCH_BETA * 0.5)), float(np.exp(-MATCH_BETA * 1.5))
 
+    def scale(vote):
+        return torch.log1p(100.0 * vote)
+
     def build(rows, own):
-        parts = []
+        trunk, votes = [], []
         for start in range(0, len(rows), 2048):
             x_rows = x_all[rows[start:start + 2048]]
             differ = n_given - x_rows @ x_fit.T
@@ -495,17 +534,25 @@ def _neighbour_features(x_all, y_fit_all, fit, evaluate, widths, twin,
             weight = torch.exp(-MATCH_BETA * differ)
             top = weight @ onehot
             bottom = (weight @ valid)[:, slot_item]
-            blocks = [x_rows, top / (bottom + near), top / (bottom + far)]
+            blocks = [scale(top / (bottom + near)), scale(top / (bottom + far))]
             if twin is not None:
                 lo, hi = twin
                 other = 1.0 - x_rows[:, lo:hi] @ x_fit[:, lo:hi].T
                 weight = torch.exp(-MATCH_BETA * (differ - other)) * other
-                blocks.append((weight @ onehot)
-                              / ((weight @ valid)[:, slot_item] + near))
-            parts.append(torch.cat(blocks, dim=1))
-        return torch.cat(parts, dim=0)
+                vote = scale((weight @ onehot)
+                             / ((weight @ valid)[:, slot_item] + near))
+                if hi - lo <= 4:
+                    blocks += [vote * x_rows[:, level:level + 1]
+                               for level in range(lo, hi)]
+                else:
+                    blocks.append(vote)
+            votes.append(torch.cat(blocks, dim=1))
+            trunk.append(torch.cat([x_rows, votes[-1]], dim=1))
+        return torch.cat(trunk, dim=0), torch.cat(votes, dim=0)
 
-    return build(fit, True), build(evaluate, False)
+    fit_trunk, fit_votes = build(fit, True)
+    eval_trunk, eval_votes = build(evaluate, False)
+    return fit_trunk, eval_trunk, fit_votes, eval_votes
 
 
 # ---------------------------------------------------------------- stacking --
@@ -606,6 +653,15 @@ def _predict_core(frame, schema, deadline, roomy=False):
                 flag = (codes[parent] >= 0) & ~np.isin(codes[parent], opens)
             elif parent in decided and schema["gated_value"] not in allowed:
                 flag = decided[parent]
+        if flag.any():
+            # Trust the gate only where the visible rows bear it out. Some
+            # instruments' gates are approximate; there the item is left to
+            # the models, which see the parent's answer as an input anyway.
+            seen = codes[name][train_rows][flag[train_rows]]
+            seen = seen[seen >= 0]
+            gate_slot = len(options[name]) - 1
+            if seen.size < 20 or np.mean(seen == gate_slot) < 0.98:
+                flag = np.zeros(n_rows, dtype=bool)
         decided[name] = flag
     decided_all = np.stack([decided[n] for n in targets], axis=1)
 
@@ -661,6 +717,7 @@ def _predict_core(frame, schema, deadline, roomy=False):
 
     # ---- torch candidates, cheapest first, each one optional -------------
     x_all, device = None, "cpu"
+    found = {"twin": None}
     if torch is not None and given:
         def usable(table):
             return (np.isfinite(table[train_rows]).all()
@@ -764,18 +821,19 @@ def _predict_core(frame, schema, deadline, roomy=False):
         # c4: neural net that also sees what the closest matches answered
         neighbour_tables = []
         def neighbour_features():
-            twin = _twin_column(x_all, train_rows, cards, device)
+            twin = found["twin"] = _twin_column(x_all, train_rows, cards,
+                                                 device)
             return [_neighbour_features(x_all, y_fit_all, fit, evaluate,
                                         widths, twin, len(given), device)
                     for fit, evaluate in splits]
-        done = run("neighbour features", neighbour_features, 2.0 * mlp_cost)
+        done = run("neighbour features", neighbour_features, 6.0 * mlp_cost)
         if done:
             features = done[0]
             for seed in (NEIGHBOUR_SEEDS[:1] if slow else NEIGHBOUR_SEEDS):
                 done = run("neighbour net seed %d" % seed,
                            lambda seed=seed: _mlp(
                                x_all, y_fit_all, splits, widths, c0, device,
-                               100 + seed, features), 2.0 * mlp_cost)
+                               100 + seed, features), 4.0 * mlp_cost)
                 if not done:
                     break
                 neighbour_tables.append(done[0])
@@ -852,7 +910,9 @@ def _predict_core(frame, schema, deadline, roomy=False):
                              len(given), device)
             drop = _best_drop(x_all, y_fit_all, splits[:-1], widths, smooth,
                               cards, device, train_rows, deadline + 60)
-            if drop is not None:
+            for drop in dict.fromkeys([drop, found["twin"]]):
+                if drop is None:
+                    continue
                 _log("profile matching also ignores GIVEN item %s"
                      % given[int(np.searchsorted(np.cumsum(cards), drop[0],
                                                  side="right"))])
