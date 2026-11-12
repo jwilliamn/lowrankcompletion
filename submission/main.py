@@ -1,4 +1,4 @@
-"""SimulacraBench submission, v3.
+"""SimulacraBench submission, v4.
 
 For every held-out respondent only the GIVEN block is visible, so each PREDICT
 item is modelled as P(answer | GIVEN). Everything is fitted inside predict()
@@ -17,8 +17,16 @@ Per item:
            per answer option, each item gets a shift and a spread along its
            option order plus a skip-slot term; far fewer parameters, meant
            for binned scores, hours and wages
+       c2c the same on GIVEN plus its interactions with the two GIVEN items
+           that say most about the answers (for example survey round or
+           country), i.e. a separate set of effects per round / country
        c3  multi-task neural net (shared trunk, one softmax head per item),
            read out at several training lengths; picks up interactions
+       c4  the same net, also fed what the respondent's closest profile
+           matches answered on every item (their votes, split by whether the
+           match differs on the "twin" GIVEN item, e.g. the other survey
+           round). The net learns how a match's answers translate into this
+           respondent's answers, instead of copying them
   3. The candidates are mixed with per-item weights chosen on the out-of-fold
      log loss. c0 is always in the mix, so an item can fall back to the crowd.
 
@@ -48,6 +56,9 @@ except Exception:  # torch missing: the logistic candidates are skipped
 # Seconds for the whole run (import + all three predict() calls). The hosted
 # limit is 900 s in Development; stay well inside it.
 TOTAL_BUDGET = float(os.environ.get("SB_BUDGET", "660"))
+# The Final phase allows 3600 s. It is recognised by the DEV respondents
+# being visible (more visible rows than the schema's n_train).
+FINAL_BUDGET = float(os.environ.get("SB_FINAL_BUDGET", "2400"))
 N_INSTRUMENTS = 3
 N_FOLDS = 5
 MIN_TRAIN_ROWS = 50
@@ -61,6 +72,12 @@ MATCH_BETA = 6.0
 MATCH_REACH = (0.5, 1.5, 2.5, 3.5)
 MATCH_DROP_REACH = (0.5, 1.5)
 MATCH_DROP_SAMPLE = 1500
+INTERACTION_COLUMNS = 2
+INTERACTION_MAX_LEVELS = 12
+INTERACTION_L2 = (1e-3, 1e-4)
+NEIGHBOUR_SEEDS = (0, 1)
+POWER_GRID = (0.85, 0.92, 1.08, 1.16, 1.25, 1.35, 1.5)
+POWER_MIN_CELLS = 300
 MLP_CHECKPOINTS = (4, 8, 16, 32)     # epochs at which the net is read out
 MLP_SEEDS = (0, 1, 2)
 MLP_HIDDEN = 512
@@ -73,7 +90,7 @@ _calls = 0
 
 def _log(message):
     if VERBOSE:
-        print("[v3 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
+        print("[v4 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
 
 
 # ---------------------------------------------------------------- encoding --
@@ -347,20 +364,26 @@ def _best_drop(x_all, y_fit_all, folds, widths, smooth, cards, device,
 
 
 # ------------------------------------------------------------ candidate c3 --
-def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed):
+def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed, features=None):
     """Multi-task net: shared trunk over one-hot GIVEN, a softmax per item.
 
     The net is read out after each epoch count in MLP_CHECKPOINTS, and each
     read-out is its own candidate, so the mixing step chooses how long to
     train, per item. Returns one table [rows, slots] per checkpoint.
+    `features`, when given, holds one (fit, evaluate) pair of input tensors
+    per split and replaces the plain one-hot GIVEN block.
     """
     helper = _Linear(widths, device)
     n_slots = helper.n_slots
     tables = [np.zeros((x_all.shape[0], n_slots)) for _ in MLP_CHECKPOINTS]
     for split_index, (fit, evaluate) in enumerate(splits):
         torch.manual_seed(1000 * seed + split_index)
+        if features is None:
+            x_fit, x_eval = x_all[fit], x_all[evaluate]
+        else:
+            x_fit, x_eval = features[split_index]
         net = torch.nn.Sequential(
-            torch.nn.Linear(x_all.shape[1], MLP_HIDDEN), torch.nn.GELU(),
+            torch.nn.Linear(x_fit.shape[1], MLP_HIDDEN), torch.nn.GELU(),
             torch.nn.Dropout(MLP_DROPOUT),
             torch.nn.Linear(MLP_HIDDEN, MLP_HIDDEN), torch.nn.GELU(),
             torch.nn.Dropout(MLP_DROPOUT),
@@ -372,11 +395,9 @@ def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed):
                 device=device, dtype=torch.float32))
         optimizer = torch.optim.AdamW(net.parameters(), lr=2e-3,
                                       weight_decay=1e-2)
-        x_fit = x_all[fit]
         y = torch.as_tensor(y_fit_all[fit], device=device)
         valid = (y >= 0).to(torch.float32)
         target = y.clamp_min(0) + helper.offsets_t
-        x_eval = x_all[evaluate]
         generator = torch.Generator(device="cpu")
         generator.manual_seed(1000 * seed + split_index)
         for epoch in range(1, max(MLP_CHECKPOINTS) + 1):
@@ -397,6 +418,94 @@ def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed):
                     tables[MLP_CHECKPOINTS.index(epoch)][evaluate] = (
                         torch.exp(log_p).double().cpu().numpy())
     return tables
+
+
+# ------------------------------------------------- interactions, neighbours --
+def _interaction_columns(g_all, y_fit_all, train_rows, cards, widths):
+    """The GIVEN items (few levels only) that say most about the answers,
+    by mutual information summed over items, corrected for level count."""
+    scores = []
+    for g, card in enumerate(cards):
+        if card > INTERACTION_MAX_LEVELS or card < 2:
+            scores.append(-np.inf)
+            continue
+        x = g_all[train_rows, g]
+        total = 0.0
+        for j, width in enumerate(widths):
+            y = y_fit_all[train_rows, j]
+            n = int(((x >= 0) & (y >= 0)).sum())
+            if n < 50:
+                continue
+            total += (_mutual_information(x, y, card, width)
+                      - (card - 1) * (width - 1) / (2.0 * n))
+        scores.append(total)
+    order = [g for g in np.argsort(scores)[::-1] if np.isfinite(scores[g])]
+    return order[:INTERACTION_COLUMNS]
+
+
+def _twin_column(x_all, train_rows, cards, device):
+    """The GIVEN item on which near-identical respondents most often differ:
+    the item g with the most visible respondents that have another visible
+    respondent identical on every GIVEN item except g. Returns its one-hot
+    (first, last) columns, or None."""
+    rng = np.random.default_rng(SEED + 2)
+    sample = rng.choice(train_rows, replace=False,
+                        size=min(2000, train_rows.size))
+    x_fit, x_sample = x_all[train_rows], x_all[sample]
+    differ = len(cards) - x_sample @ x_fit.T
+    starts = np.concatenate([[0], np.cumsum(cards)]).astype(int)
+    best, best_count = None, 0
+    for g in range(len(cards)):
+        lo, hi = int(starts[g]), int(starts[g + 1])
+        other = 1.0 - x_sample[:, lo:hi] @ x_fit[:, lo:hi].T
+        hit = ((differ - other) < 0.5) & (other > 0.5)
+        count = int(hit.any(dim=1).sum())
+        if count > best_count:
+            best, best_count = (lo, hi), count
+    return best
+
+
+def _neighbour_features(x_all, y_fit_all, fit, evaluate, widths, twin,
+                        n_given, device):
+    """Inputs for the neighbour-aware net: the one-hot GIVEN block plus, for
+    every answer slot, the vote of the respondent's closest profile matches
+    among the `fit` rows. Three votes: exact matches; matches that differ
+    only on the twin item; matches within about one mismatch. A fit row
+    never votes for itself."""
+    offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
+    n_slots = int(offsets[-1])
+    slot_item = torch.as_tensor(np.repeat(np.arange(len(widths)), widths),
+                                device=device)
+    offsets_t = torch.as_tensor(offsets[:-1], device=device)
+    y = torch.as_tensor(y_fit_all[fit], device=device)
+    valid = (y >= 0).to(torch.float32)
+    onehot = torch.zeros(len(fit), n_slots, device=device)
+    onehot.scatter_(1, y.clamp_min(0) + offsets_t, valid)
+    x_fit = x_all[fit]
+    near, far = float(np.exp(-MATCH_BETA * 0.5)), float(np.exp(-MATCH_BETA * 1.5))
+
+    def build(rows, own):
+        parts = []
+        for start in range(0, len(rows), 2048):
+            x_rows = x_all[rows[start:start + 2048]]
+            differ = n_given - x_rows @ x_fit.T
+            if own:
+                index = torch.arange(x_rows.shape[0], device=device)
+                differ[index, start + index] = 1e3
+            weight = torch.exp(-MATCH_BETA * differ)
+            top = weight @ onehot
+            bottom = (weight @ valid)[:, slot_item]
+            blocks = [x_rows, top / (bottom + near), top / (bottom + far)]
+            if twin is not None:
+                lo, hi = twin
+                other = 1.0 - x_rows[:, lo:hi] @ x_fit[:, lo:hi].T
+                weight = torch.exp(-MATCH_BETA * (differ - other)) * other
+                blocks.append((weight @ onehot)
+                              / ((weight @ valid)[:, slot_item] + near))
+            parts.append(torch.cat(blocks, dim=1))
+        return torch.cat(parts, dim=0)
+
+    return build(fit, True), build(evaluate, False)
 
 
 # ---------------------------------------------------------------- stacking --
@@ -425,8 +534,33 @@ def _mixture_weights(true_probs):
     return weights
 
 
+def _best_power(probs, picked):
+    """Sharpening exponent for one item's mixed predictions.
+
+    A weighted average of models is usually a little too cautious. Raising
+    the probabilities to a power above 1 (and renormalising) sharpens them;
+    below 1 flattens them. The power is chosen on out-of-fold predictions and
+    kept at 1 unless the gain is clear.
+    """
+    logs = np.log(np.clip(probs, 1e-9, None))
+    rows = np.arange(len(picked))
+
+    def likelihood(power):
+        scaled = power * logs
+        peak = scaled.max(axis=1, keepdims=True)
+        norm = peak[:, 0] + np.log(np.exp(scaled - peak).sum(axis=1))
+        return float((scaled[rows, picked] - norm).sum())
+
+    best, best_value = 1.0, likelihood(1.0)
+    for power in POWER_GRID:
+        value = likelihood(power)
+        if value > best_value + 2.0:
+            best, best_value = power, value
+    return best
+
+
 # -------------------------------------------------------------------- core --
-def _predict_core(frame, schema, deadline):
+def _predict_core(frame, schema, deadline, roomy=False):
     records = schema["items"]
     items = [n for n, r in records.items() if r["class"] in ("GIVEN", "PREDICT")]
     given = [n for n in items if records[n]["class"] == "GIVEN"]
@@ -562,7 +696,7 @@ def _predict_core(frame, schema, deadline):
 
         # Without a GPU everything is several times slower: run a lighter
         # schedule so the whole run stays inside the time limit.
-        slow = device == "cpu"
+        slow = device == "cpu" and not roomy
         seeds = MLP_SEEDS[:1] if slow else MLP_SEEDS
         l2_strengths = L2_STRENGTHS[1:3] if slow else L2_STRENGTHS
         tilt_l2 = TILT_L2[:1] if slow else TILT_L2
@@ -591,6 +725,69 @@ def _predict_core(frame, schema, deadline):
             if done and usable(done[0]):
                 candidates.append(done[0])
                 names.append("ordered(l2=%g)" % l2)
+
+        # c2c: logistic regression with interactions
+        try:
+            split_on = _interaction_columns(g_all, y_fit_all, train_rows,
+                                            cards, widths)
+        except Exception:
+            split_on = []
+        if split_on:
+            def interactions(l2):
+                starts = np.concatenate([[0], np.cumsum(cards)]).astype(int)
+                blocks = [x_all]
+                for g in split_on:
+                    level = x_all[:, int(starts[g]):int(starts[g + 1])]
+                    blocks.append((x_all[:, :, None] * level[:, None, :])
+                                  .reshape(n_rows, -1))
+                wide = torch.cat(blocks, dim=1)
+                table = empty()
+                for fit, evaluate in splits:
+                    bias = np.log(np.clip(c0[evaluate[0]], 1e-6, None))
+                    model = _Linear(widths, device).fit(
+                        wide[fit], y_fit_all[fit], l2, bias.astype(np.float32))
+                    table[evaluate] = model.predict(wide[evaluate])
+                return table
+            inter_cost = 0.0
+            for l2 in (INTERACTION_L2[:1] if slow else INTERACTION_L2):
+                done = run("interactions l2=%g" % l2,
+                           lambda l2=l2: interactions(l2),
+                           max(mlp_cost, 1.5 * inter_cost))
+                if not done:
+                    break
+                inter_cost = done[1]
+                if usable(done[0]):
+                    candidates.append(done[0])
+                    names.append("interactions(%s; l2=%g)" % (
+                        "+".join(given[g] for g in split_on), l2))
+
+        # c4: neural net that also sees what the closest matches answered
+        neighbour_tables = []
+        def neighbour_features():
+            twin = _twin_column(x_all, train_rows, cards, device)
+            return [_neighbour_features(x_all, y_fit_all, fit, evaluate,
+                                        widths, twin, len(given), device)
+                    for fit, evaluate in splits]
+        done = run("neighbour features", neighbour_features, 2.0 * mlp_cost)
+        if done:
+            features = done[0]
+            for seed in (NEIGHBOUR_SEEDS[:1] if slow else NEIGHBOUR_SEEDS):
+                done = run("neighbour net seed %d" % seed,
+                           lambda seed=seed: _mlp(
+                               x_all, y_fit_all, splits, widths, c0, device,
+                               100 + seed, features), 2.0 * mlp_cost)
+                if not done:
+                    break
+                neighbour_tables.append(done[0])
+            del features
+        if neighbour_tables:
+            for index, epochs in enumerate(MLP_CHECKPOINTS):
+                table = (sum(t[index] for t in neighbour_tables)
+                         / len(neighbour_tables))
+                if usable(table):
+                    candidates.append(table)
+                    names.append("neighbour net(%d epochs, %d seeds)"
+                                 % (epochs, len(neighbour_tables)))
 
         # c2: logistic regression, strongest penalty first
         last_cost = 0.0
@@ -669,6 +866,7 @@ def _predict_core(frame, schema, deadline):
             _log("profile matching skipped: %s" % type(error).__name__)
 
     result = {}
+    powers = np.ones(len(targets))
     usage = np.zeros(len(final))
     total_mix, total_smooth, total_base, total_cells = 0.0, 0.0, 0.0, 0
     for j, name in enumerate(targets):
@@ -678,6 +876,17 @@ def _predict_core(frame, schema, deadline):
         weights = _mixture_weights(true_probs)
         usage += weights
         mixed = sum(w * c[hidden_rows, lo:hi] for w, c in zip(weights, final))
+        mixed_true = true_probs @ weights
+        if rows.size >= POWER_MIN_CELLS:
+            oof = sum(w * c[rows, lo:hi] for w, c in zip(weights, final))
+            power = _best_power(oof, picked)
+            if power != 1.0:
+                powers[j] = power
+                mixed = np.clip(mixed, 1e-9, None) ** power
+                mixed /= mixed.sum(axis=1, keepdims=True)
+                oof = np.clip(oof, 1e-9, None) ** power
+                oof /= oof.sum(axis=1, keepdims=True)
+                mixed_true = oof[np.arange(rows.size), picked]
 
         # Rows the skip logic decides: that stratum's own distribution, with
         # a prior on the gate slot (the last one) in case it is empty.
@@ -697,7 +906,7 @@ def _predict_core(frame, schema, deadline):
 
         if rows.size:
             clip = lambda v: np.log(np.clip(v, 1e-12, None)).sum()
-            total_mix += clip(true_probs @ weights)
+            total_mix += clip(mixed_true)
             total_smooth += clip(true_probs[:, 0])
             total_base += clip(c0[rows, lo + picked])
             total_cells += rows.size
@@ -709,6 +918,8 @@ def _predict_core(frame, schema, deadline):
              % (len(targets), train_rows.size,
                 1.0 - total_smooth / total_base, 1.0 - total_mix / total_base,
                 ", ".join("%.2f" % (u / len(targets)) for u in usage[1:])))
+        _log("sharpening: %d of %d items changed, mean power %.3f"
+             % (int((powers != 1.0).sum()), len(targets), powers.mean()))
 
     # ---- one vector per blank cell, canonical order ----------------------
     given_marginal = {n: _smoothed(np.bincount(codes[n][codes[n] >= 0],
@@ -732,11 +943,18 @@ def predict(frame, schema):
     """One probability vector per blank cell, in canonical order."""
     global _calls
     _calls += 1
-    remaining = TOTAL_BUDGET - (time.time() - _T0)
+    budget = TOTAL_BUDGET
+    try:
+        visible = int((~frame.isna().any(axis=1)).sum())
+        if visible > int(schema["split"]["n_train"]):
+            budget = max(TOTAL_BUDGET, FINAL_BUDGET)
+    except Exception:
+        pass
+    remaining = budget - (time.time() - _T0)
     share = remaining / max(1, N_INSTRUMENTS - _calls + 1)
     deadline = time.time() + max(0.0, share)
     try:
-        return _predict_core(frame, schema, deadline)
+        return _predict_core(frame, schema, deadline, budget > TOTAL_BUDGET)
     except Exception as error:
         _log("falling back to the crowd marginal: %s" % type(error).__name__)
         return _marginal_predict(frame, schema)

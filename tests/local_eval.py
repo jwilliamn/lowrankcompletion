@@ -40,7 +40,7 @@ def options_for(schema, name):
 
 
 def synthesize(schema, seed=0, given_effect=0.7, pair_effect=1.0,
-               trait_effect=1.5, twins=0.0):
+               trait_effect=1.5, twins=0.0, dialect=0.0):
     """Invent respondents: answers depend on a hidden trait, on single GIVEN
     answers, and on a pair of GIVEN answers jointly (an interaction)."""
     rng = np.random.default_rng(seed)
@@ -118,6 +118,20 @@ def synthesize(schema, seed=0, given_effect=0.7, pair_effect=1.0,
                 frame[name] = np.where(asked & (frame[name] == schema["gated_value"]),
                                        records[name]["values"][0], frame[name])
                 frame[name] = np.where(asked, frame[name], schema["gated_value"])
+    if dialect > 0 and given:
+        # Like survey rounds that record a skipped question differently: for
+        # a share of the gated items, respondents with the first level of the
+        # first GIVEN item carry the item's first answer instead of the skip
+        # marker.
+        first_level = records[given[0]]["values"][0]
+        rows = (frame[given[0]] == first_level).to_numpy()
+        for name in items:
+            if (records[name]["class"] == "PREDICT" and records[name].get("gate")
+                    and rng.uniform() < dialect):
+                column = frame[name].to_numpy(dtype=object).copy()
+                swap = rows & (column == schema["gated_value"])
+                column[swap] = records[name]["values"][0]
+                frame[name] = column
     frame.insert(0, "respondent_id", ["r%06d" % i for i in range(n)])
     split = schema["split"]
     frame["role"] = (["TRAIN"] * split["n_train"] + ["DEV"] * split["n_dev"]
@@ -185,12 +199,16 @@ def main():
         Path(__file__).resolve().parents[1] / "submission"))
     parser.add_argument("--phase", type=int, default=1, choices=(1, 2))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--dialect", type=float, default=0.0,
+                        help="share of gated items whose skip marker depends "
+                             "on the first GIVEN item")
     parser.add_argument("--twins", type=float, default=0.0,
                         help="share of respondents that are repeat interviews")
     args = parser.parse_args()
 
     schema = load_schema(args.schema)
-    frame, items = synthesize(schema, seed=args.seed, twins=args.twins)
+    frame, items = synthesize(schema, seed=args.seed, twins=args.twins,
+                              dialect=args.dialect)
     shown, visible, cells = mask(frame, items, schema, args.phase)
 
     began = time.time()
