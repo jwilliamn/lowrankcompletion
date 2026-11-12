@@ -39,8 +39,10 @@ def options_for(schema, name):
     return values
 
 
-def synthesize(schema, seed=0, given_effect=1.0, trait_effect=1.5):
-    """Invent respondents: answers depend on a hidden trait and on GIVEN."""
+def synthesize(schema, seed=0, given_effect=0.7, pair_effect=1.0,
+               trait_effect=1.5, twins=0.0):
+    """Invent respondents: answers depend on a hidden trait, on single GIVEN
+    answers, and on a pair of GIVEN answers jointly (an interaction)."""
     rng = np.random.default_rng(seed)
     records = schema["items"]
     items = [n for n, r in records.items() if r["class"] in ("GIVEN", "PREDICT")]
@@ -64,11 +66,16 @@ def synthesize(schema, seed=0, given_effect=1.0, trait_effect=1.5):
         logits = np.tile(logits, (n, 1))
         logits += np.outer(trait, rng.normal(scale=trait_effect, size=len(values)))
         if records[name]["class"] == "PREDICT" and given:
-            for parent in rng.choice(given, size=min(2, len(given)), replace=False):
+            parents = rng.choice(given, size=min(2, len(given)), replace=False)
+            pair, size = np.zeros(n, dtype=np.int64), 1
+            for parent in parents:
                 levels = pd.Categorical(data[parent]).codes
                 effect = rng.normal(scale=given_effect,
                                     size=(levels.max() + 1, len(values)))
                 logits += effect[levels]
+                pair = pair * (levels.max() + 1) + levels
+                size *= levels.max() + 1
+            logits += rng.normal(scale=pair_effect, size=(size, len(values)))[pair]
         gumbel = -np.log(-np.log(rng.uniform(size=logits.shape)))
         answer = np.array(values, dtype=object)[np.argmax(logits + gumbel, axis=1)]
         gate = records[name].get("gate")
@@ -78,6 +85,27 @@ def synthesize(schema, seed=0, given_effect=1.0, trait_effect=1.5):
         data[name] = answer.astype(object)
 
     frame = pd.DataFrame({name: data[name] for name in items}, dtype=object)
+    if twins > 0:
+        # A share of respondents are repeat interviews of another respondent:
+        # same GIVEN block except the first GIVEN item, 5% of answers changed.
+        copies = rng.choice(n, size=int(twins * n / 2), replace=False)
+        sources = rng.permutation(np.setdiff1d(np.arange(n), copies))[:copies.size]
+        values = frame.to_numpy(dtype=object).copy()
+        fresh = values[copies].copy()
+        values[copies] = values[sources]
+        keep = rng.uniform(size=fresh.shape) < 0.05
+        keep[:, [items.index(g) for g in given]] = False
+        if given:
+            keep[:, items.index(given[0])] = True
+        values[copies] = np.where(keep, fresh, values[copies])
+        frame = pd.DataFrame(values, columns=items, dtype=object)
+        for name in order:        # re-apply skip logic after the edits
+            gate = records[name].get("gate")
+            if gate and gate["parent"] in frame:
+                asked = np.isin(frame[gate["parent"]], list(gate["observed_if"]))
+                frame[name] = np.where(asked & (frame[name] == schema["gated_value"]),
+                                       records[name]["values"][0], frame[name])
+                frame[name] = np.where(asked, frame[name], schema["gated_value"])
     frame.insert(0, "respondent_id", ["r%06d" % i for i in range(n)])
     split = schema["split"]
     frame["role"] = (["TRAIN"] * split["n_train"] + ["DEV"] * split["n_dev"]
@@ -145,10 +173,12 @@ def main():
         Path(__file__).resolve().parents[1] / "submission"))
     parser.add_argument("--phase", type=int, default=1, choices=(1, 2))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--twins", type=float, default=0.0,
+                        help="share of respondents that are repeat interviews")
     args = parser.parse_args()
 
     schema = load_schema(args.schema)
-    frame, items = synthesize(schema, seed=args.seed)
+    frame, items = synthesize(schema, seed=args.seed, twins=args.twins)
     shown, visible, cells = mask(frame, items, schema, args.phase)
 
     began = time.time()

@@ -1,4 +1,4 @@
-"""SimulacraBench submission, v1.
+"""SimulacraBench submission, v2.
 
 For every held-out respondent only the GIVEN block is visible, so each PREDICT
 item is modelled as P(answer | GIVEN). Everything is fitted inside predict()
@@ -13,8 +13,16 @@ Per item:
        c0  crowd marginal
        c1  count backoff over the two most informative GIVEN columns
        c2  multinomial logistic regression on one-hot GIVEN, three L2 strengths
+       c3  multi-task neural net (shared trunk, one softmax head per item),
+           read out at several training lengths; picks up interactions
   3. The candidates are mixed with per-item weights chosen on the out-of-fold
      log loss. c0 is always in the mix, so an item can fall back to the crowd.
+
+  4. Profile matching. Visible respondents whose GIVEN profile is identical or
+     nearly identical to the target's (for example the same household in
+     another survey round) vote with their own answers; where there is no
+     close match the mixed model from step 3 is used unchanged. How far to
+     trust the matches is again chosen per item out of fold.
 
 If anything fails, predict() returns the crowd marginal instead of raising.
 """
@@ -34,13 +42,21 @@ except Exception:  # torch missing: the logistic candidates are skipped
 
 # Seconds for the whole run (import + all three predict() calls). The hosted
 # limit is 900 s in Development; stay well inside it.
-TOTAL_BUDGET = float(os.environ.get("SB_BUDGET", "600"))
+TOTAL_BUDGET = float(os.environ.get("SB_BUDGET", "660"))
 N_INSTRUMENTS = 3
 N_FOLDS = 5
 MIN_TRAIN_ROWS = 50
 BACKOFF_ALPHA = 10.0
 BACKOFF_COLUMNS = 2
 L2_STRENGTHS = (1e-3, 1e-4, 1e-5)
+# Profile matching: weight exp(-beta * mismatches); matches further away than
+# `reach` mismatches count for less than the fallback model.
+MATCH_BETA = 6.0
+MATCH_REACH = (0.5, 1.5, 2.5, 3.5)
+MLP_CHECKPOINTS = (4, 8, 16, 32)     # epochs at which the net is read out
+MLP_SEEDS = (0, 1)
+MLP_HIDDEN = 512
+MLP_DROPOUT = 0.15
 SEED = 0
 VERBOSE = os.environ.get("SB_VERBOSE", "1") == "1"
 
@@ -49,7 +65,7 @@ _calls = 0
 
 def _log(message):
     if VERBOSE:
-        print("[v1 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
+        print("[v2 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
 
 
 # ---------------------------------------------------------------- encoding --
@@ -210,6 +226,100 @@ class _Linear:
             return torch.exp(log_p).double().cpu().numpy()
 
 
+def _masked_loss(logits, target, valid, log_norm):
+    picked = logits.gather(1, target)
+    return ((log_norm(logits) - picked) * valid).sum() / logits.shape[0]
+
+
+# -------------------------------------------------------- profile matching --
+def _match(x_all, y_fit_all, splits, widths, smooth, n_given, device):
+    """Let near-identical visible respondents vote, backed by `smooth`.
+
+    A visible respondent's weight is exp(-MATCH_BETA * mismatching GIVEN
+    answers). The fallback model `smooth` enters with the weight of a match
+    at `reach` mismatches, so closer matches override it and farther ones do
+    not. Returns one table [rows, slots] per value in MATCH_REACH.
+    """
+    offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
+    n_slots = int(offsets[-1])
+    slot_item = torch.as_tensor(np.repeat(np.arange(len(widths)), widths),
+                                device=device)
+    offsets_t = torch.as_tensor(offsets[:-1], device=device)
+    tables = [np.zeros((x_all.shape[0], n_slots)) for _ in MATCH_REACH]
+    for fit, evaluate in splits:
+        y = torch.as_tensor(y_fit_all[fit], device=device)
+        valid = (y >= 0).to(torch.float64)
+        onehot = torch.zeros(len(fit), n_slots, device=device,
+                             dtype=torch.float64)
+        onehot.scatter_(1, y.clamp_min(0) + offsets_t, valid)
+        x_fit = x_all[fit]
+        for start in range(0, len(evaluate), 2048):
+            chunk = evaluate[start:start + 2048]
+            differ = (n_given - x_all[chunk] @ x_fit.T).double()
+            weight = torch.exp(-MATCH_BETA * differ)
+            top = weight @ onehot
+            bottom = (weight @ valid)[:, slot_item]
+            prior = torch.as_tensor(smooth[chunk], device=device)
+            for index, reach in enumerate(MATCH_REACH):
+                alpha = float(np.exp(-MATCH_BETA * reach))
+                tables[index][chunk] = (
+                    (top + alpha * prior) / (bottom + alpha)).cpu().numpy()
+    return tables
+
+
+# ------------------------------------------------------------ candidate c3 --
+def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed):
+    """Multi-task net: shared trunk over one-hot GIVEN, a softmax per item.
+
+    The net is read out after each epoch count in MLP_CHECKPOINTS, and each
+    read-out is its own candidate, so the mixing step chooses how long to
+    train, per item. Returns one table [rows, slots] per checkpoint.
+    """
+    helper = _Linear(widths, device)
+    n_slots = helper.n_slots
+    tables = [np.zeros((x_all.shape[0], n_slots)) for _ in MLP_CHECKPOINTS]
+    for split_index, (fit, evaluate) in enumerate(splits):
+        torch.manual_seed(1000 * seed + split_index)
+        net = torch.nn.Sequential(
+            torch.nn.Linear(x_all.shape[1], MLP_HIDDEN), torch.nn.GELU(),
+            torch.nn.Dropout(MLP_DROPOUT),
+            torch.nn.Linear(MLP_HIDDEN, MLP_HIDDEN), torch.nn.GELU(),
+            torch.nn.Dropout(MLP_DROPOUT),
+            torch.nn.Linear(MLP_HIDDEN, n_slots)).to(device)
+        with torch.no_grad():
+            net[-1].weight.mul_(0.1)
+            net[-1].bias.copy_(torch.as_tensor(
+                np.log(np.clip(c0[evaluate[0]], 1e-6, None)),
+                device=device, dtype=torch.float32))
+        optimizer = torch.optim.AdamW(net.parameters(), lr=2e-3,
+                                      weight_decay=1e-2)
+        x_fit = x_all[fit]
+        y = torch.as_tensor(y_fit_all[fit], device=device)
+        valid = (y >= 0).to(torch.float32)
+        target = y.clamp_min(0) + helper.offsets_t
+        x_eval = x_all[evaluate]
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(1000 * seed + split_index)
+        for epoch in range(1, max(MLP_CHECKPOINTS) + 1):
+            net.train()
+            order = torch.randperm(len(fit), generator=generator).to(device)
+            for start in range(0, len(fit), 256):
+                rows = order[start:start + 256]
+                optimizer.zero_grad()
+                loss = _masked_loss(net(x_fit[rows]), target[rows],
+                                    valid[rows], helper._log_norm)
+                loss.backward()
+                optimizer.step()
+            if epoch in MLP_CHECKPOINTS:
+                net.eval()
+                with torch.no_grad():
+                    logits = net(x_eval)
+                    log_p = logits - helper._log_norm(logits)[:, helper.slot_item]
+                    tables[MLP_CHECKPOINTS.index(epoch)][evaluate] = (
+                        torch.exp(log_p).double().cpu().numpy())
+    return tables
+
+
 # ---------------------------------------------------------------- stacking --
 def _mixture_weights(true_probs):
     """Weights on the simplex that maximise the out-of-fold log likelihood.
@@ -336,51 +446,124 @@ def _predict_core(frame, schema, deadline):
     except Exception as error:
         _log("backoff skipped: %s" % type(error).__name__)
 
-    # ---- c2: logistic regression, several L2 strengths -------------------
+    # ---- torch candidates, cheapest first, each one optional -------------
+    x_all, device = None, "cpu"
     if torch is not None and given:
+        def usable(table):
+            return (np.isfinite(table[train_rows]).all()
+                    and np.isfinite(table[hidden_rows]).all())
+
         try:
             torch.manual_seed(SEED)
             device = "cuda" if torch.cuda.is_available() else "cpu"
-            x_all = np.zeros((n_rows, int(sum(cards))), dtype=np.float32)
+            x_np = np.zeros((n_rows, int(sum(cards))), dtype=np.float32)
             start = 0
             for g, card in enumerate(cards):
                 known = np.flatnonzero(g_all[:, g] >= 0)
-                x_all[known, start + g_all[known, g]] = 1.0
+                x_np[known, start + g_all[known, g]] = 1.0
                 start += card
-            x_all = torch.as_tensor(x_all, device=device)
-            last_cost = 0.0
-            for l2 in L2_STRENGTHS:
-                began = time.time()
-                if began + 1.5 * last_cost > deadline:
-                    _log("logistic l2=%g skipped: out of time" % l2)
-                    break
+            x_all = torch.as_tensor(x_np, device=device)
+        except Exception as error:
+            _log("torch setup failed: %s" % type(error).__name__)
+
+        def run(label, build, cost_guess):
+            """Run one candidate family unless the deadline is too close."""
+            began = time.time()
+            if x_all is None or began + cost_guess > deadline:
+                _log("%s skipped: out of time" % label)
+                return None
+            try:
+                built = build()
+            except Exception as error:
+                _log("%s skipped: %s" % (label, type(error).__name__))
+                return None
+            return built, time.time() - began
+
+        # c3: neural net, first seed
+        mlp_tables, mlp_cost = [], 0.0
+        done = run("net seed 0", lambda: _mlp(
+            x_all, y_fit_all, splits, widths, c0, device, MLP_SEEDS[0]), 0.0)
+        if done:
+            mlp_tables.append(done[0])
+            mlp_cost = done[1]
+
+        # c2: logistic regression, strongest penalty first
+        last_cost = 0.0
+        for l2 in L2_STRENGTHS:
+            def logistic(l2=l2):
                 table = empty()
                 for fit, evaluate in splits:
                     bias = np.log(np.clip(c0[evaluate[0]], 1e-6, None))
                     model = _Linear(widths, device).fit(
                         x_all[fit], y_fit_all[fit], l2, bias.astype(np.float32))
                     table[evaluate] = model.predict(x_all[evaluate])
-                last_cost = time.time() - began
-                if np.isfinite(table[train_rows]).all() and \
-                        np.isfinite(table[hidden_rows]).all():
+                return table
+            done = run("logistic l2=%g" % l2, logistic, 1.5 * last_cost)
+            if not done:
+                break
+            last_cost = done[1]
+            if usable(done[0]):
+                candidates.append(done[0])
+                names.append("logistic(l2=%g)" % l2)
+
+        # c3: further seeds, averaged with the first
+        for seed in MLP_SEEDS[1:]:
+            if not mlp_tables:
+                break
+            done = run("net seed %d" % seed, lambda seed=seed: _mlp(
+                x_all, y_fit_all, splits, widths, c0, device, seed),
+                1.3 * mlp_cost)
+            if not done:
+                break
+            mlp_tables.append(done[0])
+        if mlp_tables:
+            for index, epochs in enumerate(MLP_CHECKPOINTS):
+                table = sum(t[index] for t in mlp_tables) / len(mlp_tables)
+                if usable(table):
                     candidates.append(table)
-                    names.append("logistic(l2=%g)" % l2)
-        except Exception as error:
-            _log("logistic skipped: %s" % type(error).__name__)
+                    names.append("net(%d epochs, %d seeds)"
+                                 % (epochs, len(mlp_tables)))
 
     # ---- mix per item on the out-of-fold log loss ------------------------
+    def cells_of(j):
+        y = y_fit_all[train_rows, j]
+        return train_rows[y >= 0], y[y >= 0]
+
+    smooth = empty()
+    usage = np.zeros(len(candidates))
+    for j in range(len(targets)):
+        lo, hi = offsets[j], offsets[j + 1]
+        rows, picked = cells_of(j)
+        weights = _mixture_weights(np.stack(
+            [c[rows, lo + picked] for c in candidates], axis=1))
+        usage += weights
+        smooth[:, lo:hi] = sum(w * c[:, lo:hi]
+                               for w, c in zip(weights, candidates))
+    _log("mean weight: " + ", ".join(
+        "%s %.2f" % (n, u / len(targets)) for n, u in zip(names, usage)))
+
+    # ---- profile matching on top of the mixed model ----------------------
+    final = [smooth]
+    if x_all is not None and time.time() < deadline + 60:
+        try:
+            matched = _match(x_all, y_fit_all, splits, widths, smooth,
+                             len(given), device)
+            final += [t for t in matched
+                      if np.isfinite(t[train_rows]).all()
+                      and np.isfinite(t[hidden_rows]).all()]
+        except Exception as error:
+            _log("profile matching skipped: %s" % type(error).__name__)
+
     result = {}
-    total_mix, total_base, total_cells = 0.0, 0.0, 0
+    usage = np.zeros(len(final))
+    total_mix, total_smooth, total_base, total_cells = 0.0, 0.0, 0.0, 0
     for j, name in enumerate(targets):
         lo, hi = offsets[j], offsets[j + 1]
-        y = y_fit_all[train_rows, j]
-        rows = train_rows[y >= 0]
-        picked = y[y >= 0]
-        true_probs = np.stack(
-            [c[rows, lo + picked] for c in candidates], axis=1)
+        rows, picked = cells_of(j)
+        true_probs = np.stack([c[rows, lo + picked] for c in final], axis=1)
         weights = _mixture_weights(true_probs)
-        mixed = sum(w * c[hidden_rows, lo:hi]
-                    for w, c in zip(weights, candidates))
+        usage += weights
+        mixed = sum(w * c[hidden_rows, lo:hi] for w, c in zip(weights, final))
 
         # Rows the skip logic decides: that stratum's own distribution, with
         # a prior on the gate slot (the last one) in case it is empty.
@@ -394,15 +577,19 @@ def _predict_core(frame, schema, deadline):
         result[name] = mixed
 
         if rows.size:
-            total_mix += np.log(np.clip(true_probs @ weights, 1e-12, None)).sum()
-            total_base += np.log(np.clip(true_probs[:, 0], 1e-12, None)).sum()
+            clip = lambda v: np.log(np.clip(v, 1e-12, None)).sum()
+            total_mix += clip(true_probs @ weights)
+            total_smooth += clip(true_probs[:, 0])
+            total_base += clip(c0[rows, lo + picked])
             total_cells += rows.size
 
     if total_cells and total_base < 0:
-        _log("%d items, %d visible rows, candidates: %s; out-of-fold skill on "
-             "undecided cells ~ %.4f"
-             % (len(targets), train_rows.size, ", ".join(names),
-                1.0 - total_mix / total_base))
+        _log("%d items, %d visible rows; out-of-fold skill on undecided "
+             "cells: models %.4f, with profile matching %.4f; matching "
+             "weight by reach: %s"
+             % (len(targets), train_rows.size,
+                1.0 - total_smooth / total_base, 1.0 - total_mix / total_base,
+                ", ".join("%.2f" % (u / len(targets)) for u in usage[1:])))
 
     # ---- one vector per blank cell, canonical order ----------------------
     given_marginal = {n: _smoothed(np.bincount(codes[n][codes[n] >= 0],
