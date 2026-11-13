@@ -65,7 +65,9 @@ try:
     import lightgbm
 except Exception:  # not installed: the tree candidates are skipped
     lightgbm = None
-from concurrent.futures import ThreadPoolExecutor
+import pickle
+import signal
+import threading
 
 # Seconds for the whole run (import + all three predict() calls). The hosted
 # limit is 900 s in Development; stay well inside it.
@@ -544,8 +546,67 @@ def _profile_votes(x, g_all, y_all, train_rows, widths, twin):
     return out
 
 
+def _forked(task, count, workers, deadline):
+    """Run task(j) for j in range(count) in forked worker processes and
+    return {j: result} for the ones that finished.
+
+    Separate processes rather than threads, because training LightGBM models
+    from several threads at once can crash. Results come back over pipes. If
+    a worker dies or overruns, its unfinished items are simply missing.
+    """
+    pipes, pids = [], []
+    for worker in range(workers):
+        mine = list(range(worker, count, workers))
+        if not mine:
+            continue
+        read_end, write_end = os.pipe()
+        pid = os.fork()
+        if pid == 0:                              # worker process
+            try:
+                os.close(read_end)
+                with os.fdopen(write_end, "wb") as out:
+                    for j in mine:
+                        if time.time() > deadline:
+                            break
+                        pickle.dump((j, task(j)), out, protocol=4)
+                        out.flush()
+            except BaseException:
+                pass
+            finally:
+                os._exit(0)
+        os.close(write_end)
+        pipes.append(read_end)
+        pids.append(pid)
+
+    results = {}
+
+    def collect(descriptor):
+        try:
+            with os.fdopen(descriptor, "rb") as source:
+                while True:
+                    j, value = pickle.load(source)
+                    results[j] = value
+        except Exception:                         # EOFError when a worker ends
+            pass
+
+    readers = [threading.Thread(target=collect, args=(d,), daemon=True)
+               for d in pipes]
+    for reader in readers:
+        reader.start()
+    for reader in readers:
+        reader.join(max(1.0, deadline + 30.0 - time.time()))
+    for pid in pids:
+        try:
+            if any(reader.is_alive() for reader in readers):
+                os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+    return dict(results)
+
+
 def _trees(g_all, y_fit_all, splits, widths, c0, cards, votes, parents,
-           deadline, threads):
+           deadline, workers):
     """Gradient-boosted trees, one multiclass model per item and split.
 
     Inputs: the GIVEN block as ordered codes, plus (for items with five or
@@ -571,8 +632,8 @@ def _trees(g_all, y_fit_all, splits, widths, c0, cards, votes, parents,
     shared = np.concatenate(shared, axis=1)
 
     def task(j):
-        if time.time() > deadline:
-            return False
+        """Out-of-fold and held-out predictions for item j: one array
+        [rows, options] per entry of GBDT_ROUNDS, or None."""
         lo, hi = offsets[j], offsets[j + 1]
         columns, kinds = [shared], list(categorical)
         if votes:
@@ -587,6 +648,7 @@ def _trees(g_all, y_fit_all, splits, widths, c0, cards, votes, parents,
                     kinds.append(extra)
                     extra += 1
         features = np.concatenate(columns, axis=1)
+        out = [c0[:, lo:hi].astype(np.float32) for _ in GBDT_ROUNDS]
         for fit, evaluate in splits:
             y = y_fit_all[fit, j]
             keep = y >= 0
@@ -595,21 +657,18 @@ def _trees(g_all, y_fit_all, splits, widths, c0, cards, votes, parents,
                 continue
             relabel = np.full(widths[j], -1, dtype=np.int64)
             relabel[classes] = np.arange(classes.size)
+            settings = {"verbosity": -1, "max_bin": 63,
+                        "min_data_per_group": 20, "cat_smooth": 5.0,
+                        "feature_pre_filter": False, "num_threads": 1}
             data = lightgbm.Dataset(features[fit][keep], relabel[y[keep]],
                                     categorical_feature=kinds,
-                                    free_raw_data=False,
-                                    params={"verbosity": -1, "max_bin": 63,
-                                            "min_data_per_group": 20,
-                                            "cat_smooth": 5.0,
-                                            "feature_pre_filter": False})
+                                    free_raw_data=False, params=settings)
             booster = lightgbm.train(
-                {"objective": "multiclass", "num_class": int(classes.size),
-                 "learning_rate": 0.1, "num_leaves": 15,
-                 "min_data_in_leaf": 15, "bagging_fraction": 0.8,
-                 "bagging_freq": 1, "feature_fraction": 0.8,
-                 "lambda_l2": 1.0, "num_threads": 1, "verbosity": -1,
-                 "seed": SEED, "max_bin": 63, "min_data_per_group": 20,
-                 "cat_smooth": 5.0, "feature_pre_filter": False},
+                dict(settings, objective="multiclass",
+                     num_class=int(classes.size), learning_rate=0.1,
+                     num_leaves=15, min_data_in_leaf=15, bagging_fraction=0.8,
+                     bagging_freq=1, feature_fraction=0.8, lambda_l2=1.0,
+                     seed=SEED),
                 data, num_boost_round=max(GBDT_ROUNDS))
             for index, rounds in enumerate(GBDT_ROUNDS):
                 probs = np.zeros((len(evaluate), widths[j]))
@@ -618,13 +677,25 @@ def _trees(g_all, y_fit_all, splits, widths, c0, cards, votes, parents,
                         len(evaluate), classes.size)
                 # A trace of the crowd marginal, so an answer never seen in
                 # the fitting rows is unlikely rather than impossible.
-                tables[index][evaluate, lo:hi] = (
-                    0.998 * probs + 0.002 * c0[evaluate, lo:hi])
-        return True
+                out[index][evaluate] = (0.998 * probs
+                                        + 0.002 * c0[evaluate, lo:hi])
+        return out
 
-    with ThreadPoolExecutor(max_workers=threads) as pool:
-        finished = list(pool.map(task, range(len(widths))))
-    return tables, float(np.mean(finished))
+    count = len(widths)
+    try:
+        results = _forked(task, count, workers, deadline)
+    except Exception:                 # no fork here: run in this process
+        results = {}
+        for j in range(count):
+            if time.time() > deadline:
+                break
+            results[j] = task(j)
+    for j, out in results.items():
+        if out is None:
+            continue
+        for index in range(len(GBDT_ROUNDS)):
+            tables[index][:, offsets[j]:offsets[j + 1]] = out[index]
+    return tables, len(results) / float(max(1, count))
 
 
 # ------------------------------------------------- interactions, neighbours --
@@ -939,7 +1010,8 @@ def _predict_core(frame, schema, deadline, roomy=False):
                  "identical profile match"
                  % (given[twin_item] if twin_item is not None else "none",
                     100.0 * close.mean()))
-            threads = max(1, os.cpu_count() or 1)
+            workers = int(os.environ.get("SB_WORKERS", "0")) or min(
+                8, max(1, os.cpu_count() or 1))
             variants = [("trees+matches", votes), ("trees", None)]
             if close.mean() < 0.05:
                 variants.reverse()
@@ -949,7 +1021,7 @@ def _predict_core(frame, schema, deadline, roomy=False):
                     continue
                 tables, finished = _trees(
                     g_all, y_fit_all, splits, widths, c0, cards, use,
-                    parents, deadline, threads)
+                    parents, deadline, workers)
                 if finished < 1.0:
                     _log("%s: %.0f%% of items finished in time"
                          % (label, 100.0 * finished))
@@ -979,7 +1051,7 @@ def _predict_core(frame, schema, deadline, roomy=False):
                 start += card
             x_all = torch.as_tensor(x_np, device=device)
             if device == "cpu":
-                torch.set_num_threads(max(1, os.cpu_count() or 1))
+                torch.set_num_threads(min(8, max(1, os.cpu_count() or 1)))
         except Exception as error:
             _log("torch setup failed: %s" % type(error).__name__)
 
