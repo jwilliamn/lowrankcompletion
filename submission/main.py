@@ -12,6 +12,10 @@ Per item:
      fold:
        c0  crowd marginal
        c1  count backoff over the two most informative GIVEN columns
+       r   sharp count tables with gate recursion, the method of the starter
+           kit's stronger baseline: P(answer | asked) from counts within the
+           two or three most informative GIVEN items (light smoothing), and
+           P(asked) worked down the gate chain from the parent's prediction
        t   gradient-boosted trees, one model per item (LightGBM), in two
            variants: on the GIVEN block alone, and on the GIVEN block plus
            what the respondent's nearest visible profile matches answered on
@@ -96,6 +100,8 @@ POWER_GRID = (0.85, 0.92, 1.08, 1.16, 1.25, 1.35, 1.5)
 POWER_GRID_SURE = (0.7, 0.85, 1.2, 1.5, 2.0, 3.0, 5.0)   # for confident rows
 POWER_SURE = 0.9          # a row is "confident" above this top probability
 POWER_MIN_CELLS = 200
+RECURSION_ALPHA = 2.0     # pseudo-counts per level of the sharp count tables
+RECURSION_DEPTHS = (2, 3)  # GIVEN items per table
 GBDT_ROUNDS = (40, 100)   # boosting rounds at which the trees are read out
 GBDT_MAX_DISTANCE = 3     # profile matches further away than this are ignored
 MLP_CHECKPOINTS = (4, 8, 16, 32)     # epochs at which the net is read out
@@ -208,6 +214,78 @@ def _backoff(y_fit, g_fit, g_eval, cards, width):
         running = ((counts + BACKOFF_ALPHA * running)
                    / (counts.sum(axis=1, keepdims=True) + BACKOFF_ALPHA))
     return running
+
+
+def _recursion(g_all, y_all, splits, widths, cards, gates, depth, c0):
+    """Sharp count tables with gate recursion.
+
+    For each item, P(answer | asked) is counted among the visible respondents
+    who were asked, within the `depth` GIVEN items that carry the most
+    information about the answer, each level smoothed toward the coarser one
+    with RECURSION_ALPHA pseudo-counts. P(asked) is 0 or 1 when the gate's
+    parent is a GIVEN item, and otherwise the parent's own predicted
+    probability of an answer that opens the gate.
+
+    gates[j] is None, ("given", column, opening codes) or
+    ("item", parent index, opening codes). Returns a table [rows, slots].
+    """
+    n_rows = g_all.shape[0]
+    offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
+    table = np.zeros((n_rows, int(offsets[-1])))
+
+    def level(j):
+        seen, steps = set(), 0
+        while gates[j] is not None and gates[j][0] == "item" and j not in seen:
+            seen.add(j)
+            j = gates[j][1]
+            steps += 1
+        return steps
+
+    order = sorted(range(len(widths)), key=level)
+    for fit, evaluate in splits:
+        g_fit, g_eval = g_all[fit], g_all[evaluate]
+        answer, asked = {}, {}
+        for j in order:
+            values = widths[j] - (0 if gates[j] is None else 1)
+            y = y_all[fit, j]
+            was_asked = (y >= 0) & (y < values)
+            y_asked, g_asked = y[was_asked], g_fit[was_asked]
+            running = np.full((len(evaluate), values), 1.0 / values)
+            scores = [_mutual_information(g_asked[:, g], y_asked, cards[g],
+                                          values)
+                      for g in range(g_all.shape[1])]
+            key_fit = np.zeros(y_asked.size, dtype=np.int64)
+            key_eval = np.zeros(len(evaluate), dtype=np.int64)
+            size = 1
+            for g in [None] + list(np.argsort(scores)[::-1][:depth]):
+                if g is not None:
+                    card = cards[g] + 1
+                    if size * card * values > 5_000_000:
+                        break
+                    key_fit = key_fit * card + (g_asked[:, g] + 1)
+                    key_eval = key_eval * card + (g_eval[:, g] + 1)
+                    size *= card
+                counts = np.bincount(
+                    key_fit * values + y_asked,
+                    minlength=size * values).reshape(size, values)[key_eval]
+                running = ((counts + RECURSION_ALPHA * running)
+                           / (counts.sum(axis=1, keepdims=True)
+                              + RECURSION_ALPHA))
+            answer[j] = running
+            if gates[j] is None:
+                asked[j] = np.ones(len(evaluate))
+                full = running
+            else:
+                kind, parent, opens = gates[j]
+                if kind == "given":
+                    asked[j] = np.isin(g_eval[:, parent], opens).astype(float)
+                else:
+                    asked[j] = asked[parent] * answer[parent][:, opens].sum(axis=1)
+                share = asked[j][:, None]
+                full = np.concatenate([share * running, 1.0 - share], axis=1)
+            lo, hi = offsets[j], offsets[j + 1]
+            table[evaluate, lo:hi] = 0.999 * full + 0.001 * c0[evaluate, lo:hi]
+    return table
 
 
 # ------------------------------------------------------------ candidate c2 --
@@ -986,6 +1064,36 @@ def _predict_core(frame, schema, deadline, roomy=False):
             names.append("backoff")
     except Exception as error:
         _log("backoff skipped: %s" % type(error).__name__)
+
+    # ---- sharp count tables with gate recursion --------------------------
+    try:
+        if given and time.time() < deadline:
+            position = {name: j for j, name in enumerate(targets)}
+            column = {name: g for g, name in enumerate(given)}
+            gates = []
+            for name in targets:
+                gate = records[name].get("gate")
+                parent = gate["parent"] if gate else None
+                if not gate:
+                    gates.append(None)
+                elif parent in column:
+                    gates.append(("given", column[parent], [
+                        i for i, v in enumerate(options[parent])
+                        if v in gate["observed_if"]]))
+                elif parent in position:
+                    gates.append(("item", position[parent], [
+                        i for i, v in enumerate(records[parent]["values"])
+                        if v in gate["observed_if"]]))
+                else:     # parent not shipped: the gate slot is one more answer
+                    gates.append(None)
+            for depth in RECURSION_DEPTHS:
+                table = _recursion(g_all, y_all, splits, widths, cards, gates,
+                                   depth, c0)
+                if np.isfinite(table).all():
+                    candidates.append(table)
+                    names.append("tables(%d items)" % depth)
+    except Exception as error:
+        _log("tables skipped: %s" % type(error).__name__)
 
     # ---- gradient-boosted trees, with and without profile matches --------
     if lightgbm is not None and given:
