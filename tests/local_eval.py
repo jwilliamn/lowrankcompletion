@@ -98,7 +98,10 @@ def synthesize(schema, seed=0, given_effect=0.7, pair_effect=1.0,
         values = frame.to_numpy(dtype=object).copy()
         fresh = values[copies].copy()
         values[copies] = values[sources]
-        keep = rng.uniform(size=fresh.shape) < 0.05
+        # How often the repeat interview gives a different answer depends
+        # on the item: facts are stable, opinions are not.
+        change = rng.choice([0.0, 0.02, 0.1, 0.4], size=fresh.shape[1])
+        keep = rng.uniform(size=fresh.shape) < change[None, :]
         keep[:, [items.index(g) for g in given]] = False
         if given:
             # Like a survey-round column: the repeat interview always has a

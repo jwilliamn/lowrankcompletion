@@ -1,4 +1,4 @@
-"""SimulacraBench submission, v4.
+"""SimulacraBench submission, v5.
 
 For every held-out respondent only the GIVEN block is visible, so each PREDICT
 item is modelled as P(answer | GIVEN). Everything is fitted inside predict()
@@ -12,6 +12,14 @@ Per item:
      fold:
        c0  crowd marginal
        c1  count backoff over the two most informative GIVEN columns
+       t   gradient-boosted trees, one model per item (LightGBM), in two
+           variants: on the GIVEN block alone, and on the GIVEN block plus
+           what the respondent's nearest visible profile matches answered on
+           this item and on its gate parent (their most common answer, how
+           unanimous they were, how close the match is; kept apart for
+           matches in the same and in another level of the "twin" item, e.g.
+           the other survey round). Trees are sharp where the answer is
+           fully determined, and learn how far to trust a match
        c2  multinomial logistic regression on one-hot GIVEN, several L2 strengths
        c2b the same with an "ordered answers" head: instead of one free weight
            per answer option, each item gets a shift and a spread along its
@@ -53,6 +61,12 @@ try:
 except Exception:  # torch missing: the logistic candidates are skipped
     torch = None
 
+try:
+    import lightgbm
+except Exception:  # not installed: the tree candidates are skipped
+    lightgbm = None
+from concurrent.futures import ThreadPoolExecutor
+
 # Seconds for the whole run (import + all three predict() calls). The hosted
 # limit is 900 s in Development; stay well inside it.
 TOTAL_BUDGET = float(os.environ.get("SB_BUDGET", "660"))
@@ -69,15 +83,19 @@ TILT_L2 = (1e-3, 1e-4)
 # Profile matching: weight exp(-beta * mismatches); matches further away than
 # `reach` mismatches count for less than the fallback model.
 MATCH_BETA = 6.0
-MATCH_REACH = (0.5, 1.5, 2.5, 3.5)
-MATCH_DROP_REACH = (0.5, 1.5)
+MATCH_REACH = (0.5, 0.75, 1.0, 1.5, 2.5, 3.5)
+MATCH_DROP_REACH = (0.5, 0.75, 1.0, 1.5)
 MATCH_DROP_SAMPLE = 1500
 INTERACTION_COLUMNS = 2
 INTERACTION_MAX_LEVELS = 12
 INTERACTION_L2 = (1e-3, 1e-4)
 NEIGHBOUR_SEEDS = (0, 1)
 POWER_GRID = (0.85, 0.92, 1.08, 1.16, 1.25, 1.35, 1.5)
-POWER_MIN_CELLS = 300
+POWER_GRID_SURE = (0.7, 0.85, 1.2, 1.5, 2.0, 3.0, 5.0)   # for confident rows
+POWER_SURE = 0.9          # a row is "confident" above this top probability
+POWER_MIN_CELLS = 200
+GBDT_ROUNDS = (40, 100)   # boosting rounds at which the trees are read out
+GBDT_MAX_DISTANCE = 3     # profile matches further away than this are ignored
 MLP_CHECKPOINTS = (4, 8, 16, 32)     # epochs at which the net is read out
 MLP_SEEDS = (0, 1, 2)
 MLP_HIDDEN = 512
@@ -90,7 +108,7 @@ _calls = 0
 
 def _log(message):
     if VERBOSE:
-        print("[v4 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
+        print("[v5 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
 
 
 # ---------------------------------------------------------------- encoding --
@@ -450,6 +468,165 @@ def _mlp(x_all, y_fit_all, splits, widths, c0, device, seed, features=None):
     return tables
 
 
+# ------------------------------------------------------- trees and matches --
+def _twin_item(x, g_all, train_rows, cards):
+    """Index of the GIVEN item on which near-identical respondents most often
+    differ: the item g with the most visible respondents that have another
+    visible respondent identical on every GIVEN item except g."""
+    rng = np.random.default_rng(SEED + 2)
+    sample = rng.choice(train_rows, replace=False,
+                        size=min(1500, train_rows.size))
+    differ = len(cards) - x[sample] @ x[train_rows].T
+    best, best_count = None, 0
+    for g in range(len(cards)):
+        other = g_all[sample, g][:, None] != g_all[train_rows, g][None, :]
+        count = int((other & (differ < 1.5)).any(axis=1).sum())
+        if count > best_count:
+            best, best_count = g, count
+    return best
+
+
+def _profile_votes(x, g_all, y_all, train_rows, widths, twin):
+    """What each respondent's nearest visible profile matches answered.
+
+    For every respondent (visible or held out) the visible respondents with
+    the fewest mismatching GIVEN answers are found, separately among those
+    with the same and with another level of the twin item (the twin item
+    itself is not counted as a mismatch). A visible respondent is never its
+    own match. Per group: the distance, the number of matches at that
+    distance, and for every item their most common answer and its share.
+    """
+    n_rows, n_given = g_all.shape
+    offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
+    x_ref = x[train_rows]
+    onehot = np.zeros((train_rows.size, int(offsets[-1])), dtype=np.float32)
+    for j in range(len(widths)):
+        y = y_all[train_rows, j]
+        known = np.flatnonzero(y >= 0)
+        onehot[known, offsets[j] + y[known]] = 1.0
+    position = np.full(n_rows, -1, dtype=np.int64)
+    position[train_rows] = np.arange(train_rows.size)
+    names = ("same",) if twin is None else ("same", "other")
+    out = {name: {"distance": np.full(n_rows, np.nan, dtype=np.float32),
+                  "count": np.zeros(n_rows, dtype=np.float32),
+                  "answer": np.full((n_rows, len(widths)), np.nan,
+                                    dtype=np.float32),
+                  "share": np.full((n_rows, len(widths)), np.nan,
+                                   dtype=np.float32)} for name in names}
+    for start in range(0, n_rows, 1024):
+        rows = np.arange(start, min(n_rows, start + 1024))
+        differ = n_given - x[rows] @ x_ref.T
+        own = position[rows]
+        differ[np.flatnonzero(own >= 0), own[own >= 0]] = 99.0
+        if twin is None:
+            groups = {"same": differ}
+        else:
+            same = g_all[rows, twin][:, None] == g_all[train_rows, twin][None, :]
+            groups = {"same": np.where(same, differ, 99.0),
+                      "other": np.where(same, 99.0, differ - 1.0)}
+        for name, distance in groups.items():
+            nearest = distance.min(axis=1)
+            near = ((distance <= nearest[:, None] + 0.5)
+                    & (nearest[:, None] <= GBDT_MAX_DISTANCE + 0.5))
+            votes = near.astype(np.float32) @ onehot
+            count = near.sum(axis=1)
+            found = count > 0
+            out[name]["distance"][rows] = np.where(found, nearest, np.nan)
+            out[name]["count"][rows] = count
+            for j in range(len(widths)):
+                block = votes[:, offsets[j]:offsets[j + 1]]
+                total = block.sum(axis=1)
+                seen = total > 0
+                out[name]["answer"][rows, j] = np.where(
+                    seen, block.argmax(axis=1), np.nan)
+                out[name]["share"][rows, j] = np.where(
+                    seen, block.max(axis=1) / np.maximum(total, 1.0), np.nan)
+    return out
+
+
+def _trees(g_all, y_fit_all, splits, widths, c0, cards, votes, parents,
+           deadline, threads):
+    """Gradient-boosted trees, one multiclass model per item and split.
+
+    Inputs: the GIVEN block as ordered codes, plus (for items with five or
+    more levels) the same codes again as unordered categories, so a tree can
+    use either reading. With `votes`, also the nearest profile matches'
+    answer on this item and on its gate parent, their share and distance.
+    Returns one table [rows, slots] per entry of GBDT_ROUNDS and the share
+    of items that finished in time (the rest keep the crowd marginal).
+    """
+    n_rows = g_all.shape[0]
+    offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
+    tables = [c0.copy() for _ in GBDT_ROUNDS]
+    ordered = np.where(g_all >= 0, g_all, np.nan).astype(np.float32)
+    nominal = [g for g, card in enumerate(cards) if card >= 5]
+    shared = [ordered, ordered[:, nominal]]
+    categorical = list(range(ordered.shape[1],
+                             ordered.shape[1] + len(nominal)))
+    width = ordered.shape[1] + len(nominal)
+    if votes:
+        for group in votes.values():
+            shared += [group["distance"][:, None], group["count"][:, None]]
+            width += 2
+    shared = np.concatenate(shared, axis=1)
+
+    def task(j):
+        if time.time() > deadline:
+            return False
+        lo, hi = offsets[j], offsets[j + 1]
+        columns, kinds = [shared], list(categorical)
+        if votes:
+            extra = width
+            for group in votes.values():
+                columns += [group["answer"][:, j:j + 1],
+                            group["share"][:, j:j + 1]]
+                kinds.append(extra)
+                extra += 2
+                if parents[j] is not None:
+                    columns.append(group["answer"][:, parents[j]:parents[j] + 1])
+                    kinds.append(extra)
+                    extra += 1
+        features = np.concatenate(columns, axis=1)
+        for fit, evaluate in splits:
+            y = y_fit_all[fit, j]
+            keep = y >= 0
+            classes = np.unique(y[keep])
+            if keep.sum() < 40 or classes.size < 2:
+                continue
+            relabel = np.full(widths[j], -1, dtype=np.int64)
+            relabel[classes] = np.arange(classes.size)
+            data = lightgbm.Dataset(features[fit][keep], relabel[y[keep]],
+                                    categorical_feature=kinds,
+                                    free_raw_data=False,
+                                    params={"verbosity": -1, "max_bin": 63,
+                                            "min_data_per_group": 20,
+                                            "cat_smooth": 5.0,
+                                            "feature_pre_filter": False})
+            booster = lightgbm.train(
+                {"objective": "multiclass", "num_class": int(classes.size),
+                 "learning_rate": 0.1, "num_leaves": 15,
+                 "min_data_in_leaf": 15, "bagging_fraction": 0.8,
+                 "bagging_freq": 1, "feature_fraction": 0.8,
+                 "lambda_l2": 1.0, "num_threads": 1, "verbosity": -1,
+                 "seed": SEED, "max_bin": 63, "min_data_per_group": 20,
+                 "cat_smooth": 5.0, "feature_pre_filter": False},
+                data, num_boost_round=max(GBDT_ROUNDS))
+            for index, rounds in enumerate(GBDT_ROUNDS):
+                probs = np.zeros((len(evaluate), widths[j]))
+                probs[:, classes] = booster.predict(
+                    features[evaluate], num_iteration=rounds).reshape(
+                        len(evaluate), classes.size)
+                # A trace of the crowd marginal, so an answer never seen in
+                # the fitting rows is unlikely rather than impossible.
+                tables[index][evaluate, lo:hi] = (
+                    0.998 * probs + 0.002 * c0[evaluate, lo:hi])
+        return True
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        finished = list(pool.map(task, range(len(widths))))
+    return tables, float(np.mean(finished))
+
+
 # ------------------------------------------------- interactions, neighbours --
 def _interaction_columns(g_all, y_fit_all, train_rows, cards, widths):
     """The GIVEN items (few levels only) that say most about the answers,
@@ -581,8 +758,8 @@ def _mixture_weights(true_probs):
     return weights
 
 
-def _best_power(probs, picked):
-    """Sharpening exponent for one item's mixed predictions.
+def _best_power(probs, picked, grid):
+    """Sharpening exponent for a set of mixed predictions.
 
     A weighted average of models is usually a little too cautious. Raising
     the probabilities to a power above 1 (and renormalising) sharpens them;
@@ -599,15 +776,39 @@ def _best_power(probs, picked):
         return float((scaled[rows, picked] - norm).sum())
 
     best, best_value = 1.0, likelihood(1.0)
-    for power in POWER_GRID:
+    for power in grid:
         value = likelihood(power)
         if value > best_value + 2.0:
             best, best_value = power, value
     return best
 
 
+def _sharpen(oof, picked, mixed):
+    """Recalibrate one item's mixed predictions, separately for confident
+    rows (top probability above POWER_SURE) and for the rest: an average of
+    models is most over-cautious exactly where one of them is nearly sure.
+    Returns the adjusted held-out predictions, the adjusted out-of-fold
+    predictions, and the two powers used."""
+    powers = []
+    sure_oof = oof.max(axis=1) >= POWER_SURE
+    sure_mixed = mixed.max(axis=1) >= POWER_SURE
+    oof, mixed = oof.copy(), mixed.copy()
+    for sure, grid in ((True, POWER_GRID_SURE), (False, POWER_GRID)):
+        rows = sure_oof == sure
+        power = 1.0
+        if rows.sum() >= POWER_MIN_CELLS:
+            power = _best_power(oof[rows], picked[rows], grid)
+        powers.append(power)
+        if power != 1.0:
+            for table, part in ((oof, rows), (mixed, sure_mixed == sure)):
+                sharp = np.clip(table[part], 1e-9, None) ** power
+                table[part] = sharp / sharp.sum(axis=1, keepdims=True)
+    return mixed, oof, powers
+
+
 # -------------------------------------------------------------------- core --
 def _predict_core(frame, schema, deadline, roomy=False):
+    share = max(1.0, deadline - time.time())
     records = schema["items"]
     items = [n for n, r in records.items() if r["class"] in ("GIVEN", "PREDICT")]
     given = [n for n in items if records[n]["class"] == "GIVEN"]
@@ -715,6 +916,50 @@ def _predict_core(frame, schema, deadline, roomy=False):
     except Exception as error:
         _log("backoff skipped: %s" % type(error).__name__)
 
+    # ---- gradient-boosted trees, with and without profile matches --------
+    if lightgbm is not None and given:
+        try:
+            x_np = np.zeros((n_rows, int(sum(cards))), dtype=np.float32)
+            start = 0
+            for g, card in enumerate(cards):
+                known = np.flatnonzero(g_all[:, g] >= 0)
+                x_np[known, start + g_all[known, g]] = 1.0
+                start += card
+            twin_item = _twin_item(x_np, g_all, train_rows, cards)
+            votes = _profile_votes(x_np, g_all, y_all, train_rows, widths,
+                                   twin_item)
+            del x_np
+            close = np.zeros(train_rows.size, dtype=bool)
+            for group in votes.values():
+                close |= group["distance"][train_rows] < 0.5
+            position = {name: j for j, name in enumerate(targets)}
+            parents = [position.get((records[name].get("gate") or {})
+                                    .get("parent")) for name in targets]
+            _log("twin item: %s; %.0f%% of visible respondents have an "
+                 "identical profile match"
+                 % (given[twin_item] if twin_item is not None else "none",
+                    100.0 * close.mean()))
+            threads = max(1, os.cpu_count() or 1)
+            variants = [("trees+matches", votes), ("trees", None)]
+            if close.mean() < 0.05:
+                variants.reverse()
+            for label, use in variants:
+                if time.time() > deadline - 0.15 * share:
+                    _log("%s skipped: out of time" % label)
+                    continue
+                tables, finished = _trees(
+                    g_all, y_fit_all, splits, widths, c0, cards, use,
+                    parents, deadline, threads)
+                if finished < 1.0:
+                    _log("%s: %.0f%% of items finished in time"
+                         % (label, 100.0 * finished))
+                for rounds, table in zip(GBDT_ROUNDS, tables):
+                    if np.isfinite(table).all():
+                        candidates.append(table)
+                        names.append("%s(%d rounds)" % (label, rounds))
+        except Exception as error:
+            _log("trees skipped: %s" % type(error).__name__)
+
     # ---- torch candidates, cheapest first, each one optional -------------
     x_all, device = None, "cpu"
     found = {"twin": None}
@@ -761,7 +1006,8 @@ def _predict_core(frame, schema, deadline, roomy=False):
         # c3: neural net, first seed
         mlp_tables, mlp_cost = [], 0.0
         done = run("net seed 0", lambda: _mlp(
-            x_all, y_fit_all, splits, widths, c0, device, MLP_SEEDS[0]), 0.0)
+            x_all, y_fit_all, splits, widths, c0, device, MLP_SEEDS[0]),
+            0.35 * share if slow else 0.0)
         if done:
             mlp_tables.append(done[0])
             mlp_cost = done[1]
@@ -926,7 +1172,7 @@ def _predict_core(frame, schema, deadline, roomy=False):
             _log("profile matching skipped: %s" % type(error).__name__)
 
     result = {}
-    powers = np.ones(len(targets))
+    powers = np.ones((len(targets), 2))
     usage = np.zeros(len(final))
     total_mix, total_smooth, total_base, total_cells = 0.0, 0.0, 0.0, 0
     for j, name in enumerate(targets):
@@ -939,14 +1185,9 @@ def _predict_core(frame, schema, deadline, roomy=False):
         mixed_true = true_probs @ weights
         if rows.size >= POWER_MIN_CELLS:
             oof = sum(w * c[rows, lo:hi] for w, c in zip(weights, final))
-            power = _best_power(oof, picked)
-            if power != 1.0:
-                powers[j] = power
-                mixed = np.clip(mixed, 1e-9, None) ** power
-                mixed /= mixed.sum(axis=1, keepdims=True)
-                oof = np.clip(oof, 1e-9, None) ** power
-                oof /= oof.sum(axis=1, keepdims=True)
-                mixed_true = oof[np.arange(rows.size), picked]
+            mixed, oof, used = _sharpen(oof, picked, mixed)
+            powers[j] = used
+            mixed_true = oof[np.arange(rows.size), picked]
 
         # Rows the skip logic decides: that stratum's own distribution, with
         # a prior on the gate slot (the last one) in case it is empty.
@@ -978,8 +1219,8 @@ def _predict_core(frame, schema, deadline, roomy=False):
              % (len(targets), train_rows.size,
                 1.0 - total_smooth / total_base, 1.0 - total_mix / total_base,
                 ", ".join("%.2f" % (u / len(targets)) for u in usage[1:])))
-        _log("sharpening: %d of %d items changed, mean power %.3f"
-             % (int((powers != 1.0).sum()), len(targets), powers.mean()))
+        _log("sharpening: mean power %.2f on confident rows, %.2f elsewhere"
+             % (powers[:, 0].mean(), powers[:, 1].mean()))
 
     # ---- one vector per blank cell, canonical order ----------------------
     given_marginal = {n: _smoothed(np.bincount(codes[n][codes[n] >= 0],
