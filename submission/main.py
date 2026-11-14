@@ -1,4 +1,4 @@
-"""SimulacraBench submission, v5.
+"""SimulacraBench submission, v5b.
 
 For every held-out respondent only the GIVEN block is visible, so each PREDICT
 item is modelled as P(answer | GIVEN). Everything is fitted inside predict()
@@ -16,7 +16,8 @@ Per item:
            kit's stronger baseline: P(answer | asked) from counts within the
            two or three most informative GIVEN items (light smoothing), and
            P(asked) worked down the gate chain from the parent's prediction
-       t   gradient-boosted trees, one model per item (LightGBM), in two
+       t   (switched off, see USE_TREES) gradient-boosted trees, one model
+           per item (LightGBM), in two
            variants: on the GIVEN block alone, and on the GIVEN block plus
            what the respondent's nearest visible profile matches answered on
            this item and on its gate parent (their most common answer, how
@@ -102,6 +103,12 @@ POWER_SURE = 0.9          # a row is "confident" above this top probability
 POWER_MIN_CELLS = 200
 RECURSION_ALPHA = 2.0     # pseudo-counts per level of the sharp count tables
 RECURSION_DEPTHS = (2, 3)  # GIVEN items per table
+# The tree candidates are switched off. Two problems showed up at real size:
+# worker processes forked after other libraries had started threads hung, and
+# the profile-match inputs were built in a way that let a model read a
+# visible respondent's own answer back out of them, which made the trees look
+# far better in cross-validation than on held-out respondents.
+USE_TREES = os.environ.get("SB_TREES", "0") == "1"
 GBDT_ROUNDS = (40, 100)   # boosting rounds at which the trees are read out
 GBDT_MAX_DISTANCE = 3     # profile matches further away than this are ignored
 MLP_CHECKPOINTS = (4, 8, 16, 32)     # epochs at which the net is read out
@@ -116,7 +123,7 @@ _calls = 0
 
 def _log(message):
     if VERBOSE:
-        print("[v5 %6.1fs] %s" % (time.time() - _T0, message), flush=True)
+        print("[v5b %5.1fs] %s" % (time.time() - _T0, message), flush=True)
 
 
 # ---------------------------------------------------------------- encoding --
@@ -1096,7 +1103,7 @@ def _predict_core(frame, schema, deadline, roomy=False):
         _log("tables skipped: %s" % type(error).__name__)
 
     # ---- gradient-boosted trees, with and without profile matches --------
-    if lightgbm is not None and given:
+    if USE_TREES and lightgbm is not None and given:
         try:
             x_np = np.zeros((n_rows, int(sum(cards))), dtype=np.float32)
             start = 0
