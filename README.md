@@ -1,19 +1,19 @@
 # SimulacraBench submission
 
 - `PROPOSAL.md`: the plan.
-- `submission/main.py`: the code that gets uploaded (v5).
+- `submission/main.py`: the code that gets uploaded (v5b).
 - `tests/local_eval.py`: a local stand-in for the grader, on synthetic answers.
 
 Build the upload:
 
 ```bash
-cd submission && zip -r ../dist/submission_v5.zip . -x '__pycache__/*'
+cd submission && zip -r ../dist/submission_v5b.zip . -x '__pycache__/*'
 ```
 
 Check it with the organizers' tools (from a clone of `SituatedEvals/public`):
 
 ```bash
-python tools/check_submission_zip.py /path/to/dist/submission_v5.zip
+python tools/check_submission_zip.py /path/to/dist/submission_v5b.zip
 ```
 
 Local smoke test (schemas come from the starter kit's `data/`):
