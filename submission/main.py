@@ -1,4 +1,4 @@
-"""SimulacraBench submission, v5b.
+"""SimulacraBench submission, v5c.
 
 For every held-out respondent only the GIVEN block is visible, so each PREDICT
 item is modelled as P(answer | GIVEN). Everything is fitted inside predict()
@@ -16,15 +16,17 @@ Per item:
            kit's stronger baseline: P(answer | asked) from counts within the
            two or three most informative GIVEN items (light smoothing), and
            P(asked) worked down the gate chain from the parent's prediction
-       t   (switched off, see USE_TREES) gradient-boosted trees, one model
-           per item (LightGBM), in two
+       t   gradient-boosted trees on the GIVEN block, one model per item
+           (LightGBM); sharp where the answer is fully determined, and they
+           read ordered GIVEN answers as ordered.
+           (Switched off, see USE_TREE_MATCHES: a second variant, in two
            variants: on the GIVEN block alone, and on the GIVEN block plus
            what the respondent's nearest visible profile matches answered on
            this item and on its gate parent (their most common answer, how
            unanimous they were, how close the match is; kept apart for
            matches in the same and in another level of the "twin" item, e.g.
            the other survey round). Trees are sharp where the answer is
-           fully determined, and learn how far to trust a match
+           fully determined, and learn how far to trust a match.)
        c2  multinomial logistic regression on one-hot GIVEN, several L2 strengths
        c2b the same with an "ordered answers" head: instead of one free weight
            per answer option, each item gets a shift and a spread along its
@@ -103,13 +105,15 @@ POWER_SURE = 0.9          # a row is "confident" above this top probability
 POWER_MIN_CELLS = 200
 RECURSION_ALPHA = 2.0     # pseudo-counts per level of the sharp count tables
 RECURSION_DEPTHS = (2, 3)  # GIVEN items per table
-# The tree candidates are switched off. Two problems showed up at real size:
-# worker processes forked after other libraries had started threads hung, and
-# the profile-match inputs were built in a way that let a model read a
-# visible respondent's own answer back out of them, which made the trees look
-# far better in cross-validation than on held-out respondents.
-USE_TREES = os.environ.get("SB_TREES", "0") == "1"
-GBDT_ROUNDS = (40, 100)   # boosting rounds at which the trees are read out
+# Gradient-boosted trees on the GIVEN block, one model per item. They run in
+# this process (LightGBM's own threads). The variant fed with profile matches
+# stays off: its inputs let a model read a visible respondent's own answer
+# back out of them, and worker processes forked for it hung.
+USE_TREES = os.environ.get("SB_TREES", "1") == "1"
+USE_TREE_MATCHES = False
+GBDT_ROUNDS = (25, 60)    # boosting rounds at which the trees are read out
+TREE_FOLDS = 3            # cross-fitting folds for the trees
+TREE_SHARE = 0.45         # share of an instrument's time the trees may use
 GBDT_MAX_DISTANCE = 3     # profile matches further away than this are ignored
 MLP_CHECKPOINTS = (4, 8, 16, 32)     # epochs at which the net is read out
 MLP_SEEDS = (0, 1, 2)
@@ -123,7 +127,7 @@ _calls = 0
 
 def _log(message):
     if VERBOSE:
-        print("[v5b %5.1fs] %s" % (time.time() - _T0, message), flush=True)
+        print("[v5c %5.1fs] %s" % (time.time() - _T0, message), flush=True)
 
 
 # ---------------------------------------------------------------- encoding --
@@ -631,6 +635,65 @@ def _profile_votes(x, g_all, y_all, train_rows, widths, twin):
     return out
 
 
+def _trees_plain(g_all, y_fit_all, fold_of, train_rows, hidden_rows, widths,
+                 c0, cards, deadline, threads):
+    """Gradient-boosted trees on the GIVEN block, one multiclass model per
+    item, cross-fitted over TREE_FOLDS folds of the visible respondents.
+
+    Inputs: every GIVEN item as ordered codes, plus (for items with five or
+    more levels) the same codes again as unordered categories, so a tree can
+    use either reading. Returns one table [rows, slots] per entry of
+    GBDT_ROUNDS and the share of items finished before the deadline; items
+    not reached keep the crowd marginal.
+    """
+    offsets = np.concatenate([[0], np.cumsum(widths)]).astype(int)
+    tables = [c0.copy() for _ in GBDT_ROUNDS]
+    ordered = np.where(g_all >= 0, g_all, np.nan).astype(np.float32)
+    nominal = [g for g, card in enumerate(cards) if card >= 5]
+    features = np.concatenate([ordered, ordered[:, nominal]], axis=1)
+    categorical = list(range(ordered.shape[1], features.shape[1]))
+    part = fold_of[train_rows] % TREE_FOLDS
+    splits = [(train_rows[part != f], train_rows[part == f])
+              for f in range(TREE_FOLDS)] + [(train_rows, hidden_rows)]
+    settings = {"verbosity": -1, "max_bin": 63, "min_data_per_group": 20,
+                "cat_smooth": 5.0, "feature_pre_filter": False,
+                "num_threads": int(threads)}
+    done = 0
+    for j in range(len(widths)):
+        if time.time() > deadline:
+            break
+        lo, hi = offsets[j], offsets[j + 1]
+        for fit, evaluate in splits:
+            y = y_fit_all[fit, j]
+            keep = y >= 0
+            classes = np.unique(y[keep])
+            if keep.sum() < 40 or classes.size < 2 or len(evaluate) == 0:
+                continue
+            relabel = np.full(widths[j], -1, dtype=np.int64)
+            relabel[classes] = np.arange(classes.size)
+            data = lightgbm.Dataset(features[fit][keep], relabel[y[keep]],
+                                    categorical_feature=categorical,
+                                    free_raw_data=False, params=settings)
+            booster = lightgbm.train(
+                dict(settings, objective="multiclass",
+                     num_class=int(classes.size), learning_rate=0.15,
+                     num_leaves=15, min_data_in_leaf=15, bagging_fraction=0.8,
+                     bagging_freq=1, feature_fraction=0.8, lambda_l2=1.0,
+                     seed=SEED),
+                data, num_boost_round=max(GBDT_ROUNDS))
+            for index, rounds in enumerate(GBDT_ROUNDS):
+                probs = np.zeros((len(evaluate), widths[j]))
+                probs[:, classes] = booster.predict(
+                    features[evaluate], num_iteration=rounds).reshape(
+                        len(evaluate), classes.size)
+                # A trace of the crowd marginal, so an answer never seen in
+                # the fitting rows is unlikely rather than impossible.
+                tables[index][evaluate, lo:hi] = (
+                    0.998 * probs + 0.002 * c0[evaluate, lo:hi])
+        done += 1
+    return tables, done / float(max(1, len(widths)))
+
+
 def _forked(task, count, workers, deadline):
     """Run task(j) for j in range(count) in forked worker processes and
     return {j: result} for the ones that finished.
@@ -1102,8 +1165,25 @@ def _predict_core(frame, schema, deadline, roomy=False):
     except Exception as error:
         _log("tables skipped: %s" % type(error).__name__)
 
-    # ---- gradient-boosted trees, with and without profile matches --------
+    # ---- gradient-boosted trees on the GIVEN block -----------------------
     if USE_TREES and lightgbm is not None and given:
+        try:
+            tables, finished = _trees_plain(
+                g_all, y_fit_all, fold_of, train_rows, hidden_rows, widths,
+                c0, cards,
+                min(deadline, time.time() + (0.6 if roomy else TREE_SHARE) * share),
+                min(8, max(1, os.cpu_count() or 1)))
+            _log("trees: %.0f%% of items done" % (100.0 * finished))
+            if finished > 0:
+                for rounds, table in zip(GBDT_ROUNDS, tables):
+                    if np.isfinite(table).all():
+                        candidates.append(table)
+                        names.append("trees(%d rounds)" % rounds)
+        except Exception as error:
+            _log("trees skipped: %s" % type(error).__name__)
+
+    # ---- (off) trees fed with profile matches ----------------------------
+    if USE_TREE_MATCHES and lightgbm is not None and given:
         try:
             x_np = np.zeros((n_rows, int(sum(cards))), dtype=np.float32)
             start = 0
